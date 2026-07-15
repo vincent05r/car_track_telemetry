@@ -19,6 +19,7 @@ from telemetry_overlay import (
     build_sync_info,
     build_track_reference,
     discover_recording_pairs,
+    format_overlay_delta,
     probe_video,
     render_overlay_preview,
     render_overlay_video,
@@ -119,6 +120,7 @@ def test_track_projection_and_sampler_scaling() -> None:
     track = build_track_reference(telemetry, lap=1, points=300)
     sampler = TelemetrySampler(telemetry, sync)
     sample = sampler.sample(2.0)
+    launch_sample = sampler.sample(0.0)
     projection = track.project(sample.latitude, sample.longitude)
 
     assert track.total_distance_m == pytest.approx(2 * np.pi * 500, rel=0.03)
@@ -128,6 +130,36 @@ def test_track_projection_and_sampler_scaling() -> None:
     assert sample.battery_thermal_pct == pytest.approx(66.6667)
     assert sample.front_inverter_thermal_pct == pytest.approx(70.0)
     assert sample.brake_bar >= 0
+    assert launch_sample.regen_kw == pytest.approx(100.0)
+    assert launch_sample.total_g == pytest.approx(0.5)
+    assert track.lap_time_ms == pytest.approx(7_980.0)
+    assert projection.reference_elapsed_ms == pytest.approx(
+        sample.lap_elapsed_ms,
+        abs=120.0,
+    )
+    assert track.delta_to_reference_ms(
+        sample.lap_elapsed_ms,
+        projection,
+    ) == pytest.approx(0.0, abs=120.0)
+
+
+def test_delta_format_and_panel_geometry_regression() -> None:
+    telemetry = synthetic_telemetry()
+    renderer = TelemetryOverlayRenderer(build_track_reference(telemetry, lap=1))
+
+    assert format_overlay_delta(-179.4) == "-0.179"
+    assert format_overlay_delta(842.6) == "+0.843"
+    assert format_overlay_delta(float("nan")) == "--.---"
+    assert renderer.panel_boxes((1440, 934)) == {
+        "speed": (23, 23, 361, 195),
+        "track": (1029, 23, 1417, 312),
+        "inputs": (23, 762, 469, 911),
+        "dynamics": (479, 762, 831, 911),
+        "thermal": (993, 743, 1417, 911),
+    }
+
+    with pytest.raises(ValueError, match="scale maxima"):
+        OverlayStyle(max_regen_kw=0)
 
 
 def test_overlay_renderer_returns_same_frame_size() -> None:

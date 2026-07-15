@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
+from functools import cached_property
 from pathlib import Path
 import re
 from typing import Any, Callable, Iterable
@@ -400,6 +401,7 @@ class TrackProjection:
     x_m: float
     y_m: float
     distance_from_reference_m: float
+    reference_elapsed_ms: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -411,9 +413,24 @@ class TrackReference:
     x_m: np.ndarray
     y_m: np.ndarray
     cumulative_m: np.ndarray
+    elapsed_ms: np.ndarray
     total_distance_m: float
+    lap_time_ms: float
     lap: int
     source: str
+
+    @cached_property
+    def _projection_segments(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cache immutable segment arrays used by every frame projection."""
+
+        starts = np.column_stack([self.x_m[:-1], self.y_m[:-1]])
+        ends = np.column_stack([self.x_m[1:], self.y_m[1:]])
+        vectors = ends - starts
+        length_squared = np.einsum("ij,ij->i", vectors, vectors)
+        safe_length_squared = np.where(length_squared > 0, length_squared, 1.0)
+        return starts, vectors, length_squared, safe_length_squared
 
     def to_local(self, latitude: float, longitude: float) -> tuple[float, float]:
         metres_per_degree = np.pi * EARTH_RADIUS_M / 180.0
@@ -427,13 +444,9 @@ class TrackReference:
 
     def project(self, latitude: float, longitude: float) -> TrackProjection:
         if not np.isfinite(latitude) or not np.isfinite(longitude):
-            return TrackProjection(*(float("nan"),) * 4)
+            return TrackProjection(*(float("nan"),) * 5)
         point = np.asarray(self.to_local(latitude, longitude), dtype=float)
-        starts = np.column_stack([self.x_m[:-1], self.y_m[:-1]])
-        ends = np.column_stack([self.x_m[1:], self.y_m[1:]])
-        vectors = ends - starts
-        length_squared = np.einsum("ij,ij->i", vectors, vectors)
-        safe_length_squared = np.where(length_squared > 0, length_squared, 1.0)
+        starts, vectors, length_squared, safe_length_squared = self._projection_segments
         fractions = np.einsum("ij,ij->i", point - starts, vectors) / safe_length_squared
         fractions = np.clip(fractions, 0.0, 1.0)
         projected = starts + vectors * fractions[:, None]
@@ -443,12 +456,43 @@ class TrackReference:
         distance = float(np.sqrt(np.dot(errors[index], errors[index])))
         along = float(self.cumulative_m[index] + fractions[index] * segment_length)
         progress = along / self.total_distance_m if self.total_distance_m > 0 else 0.0
+        reference_elapsed_ms = float(
+            np.interp(along, self.cumulative_m, self.elapsed_ms)
+        )
         return TrackProjection(
             progress=float(progress % 1.0),
             x_m=float(projected[index, 0]),
             y_m=float(projected[index, 1]),
             distance_from_reference_m=distance,
+            reference_elapsed_ms=reference_elapsed_ms,
         )
+
+    def delta_to_reference_ms(
+        self,
+        lap_elapsed_ms: float,
+        projection: TrackProjection,
+    ) -> float:
+        """Return signed live delta to this lap at the projected track position."""
+
+        reference_elapsed_ms = projection.reference_elapsed_ms
+        if (
+            not np.isfinite(lap_elapsed_ms)
+            or not np.isfinite(reference_elapsed_ms)
+            or projection.distance_from_reference_m
+            > max(35.0, self.total_distance_m * 0.015)
+        ):
+            return float("nan")
+        if (
+            lap_elapsed_ms > self.lap_time_ms * 0.75
+            and reference_elapsed_ms < self.lap_time_ms * 0.25
+        ):
+            reference_elapsed_ms += self.lap_time_ms
+        elif (
+            lap_elapsed_ms < self.lap_time_ms * 0.25
+            and reference_elapsed_ms > self.lap_time_ms * 0.75
+        ):
+            reference_elapsed_ms -= self.lap_time_ms
+        return float(lap_elapsed_ms - reference_elapsed_ms)
 
 
 def _local_coordinates(
@@ -521,7 +565,13 @@ def build_track_reference(
     selected_lap = choose_reference_lap(telemetry) if lap is None else int(lap)
     clean = (
         telemetry.loc[telemetry["Lap"].eq(selected_lap)]
-        .dropna(subset=["Latitude (decimal)", "Longitude (decimal)"])
+        .dropna(
+            subset=[
+                "Latitude (decimal)",
+                "Longitude (decimal)",
+                "Elapsed Time (ms)",
+            ]
+        )
         .sort_values("Sample Index", kind="stable")
     )
     if len(clean) < 100:
@@ -529,6 +579,10 @@ def build_track_reference(
 
     latitude = clean["Latitude (decimal)"].to_numpy(dtype=float)
     longitude = clean["Longitude (decimal)"].to_numpy(dtype=float)
+    elapsed = clean["Elapsed Time (ms)"].to_numpy(dtype=float)
+    lap_time_ms = float(np.nanmax(elapsed))
+    if not np.isfinite(lap_time_ms) or lap_time_ms <= 0:
+        raise ValueError(f"Lap {selected_lap} does not have a valid lap time")
     origin_latitude = float(np.mean(latitude))
     origin_longitude = float(np.mean(longitude))
     x, y = _local_coordinates(
@@ -540,6 +594,7 @@ def build_track_reference(
     steps = np.r_[True, np.hypot(np.diff(x), np.diff(y)) > 0.25]
     x = x[steps]
     y = y[steps]
+    elapsed = elapsed[steps]
     if len(x) < 20:
         raise ValueError(f"Lap {selected_lap} does not have enough distinct GPS points")
 
@@ -553,11 +608,16 @@ def build_track_reference(
     if closure_distance <= max(75.0, initial_distance * 0.03):
         x = np.r_[x, x[0]]
         y = np.r_[y, y[0]]
+        elapsed = np.r_[elapsed, lap_time_ms]
 
     segment_lengths = np.hypot(np.diff(x), np.diff(y))
     moving = np.r_[True, segment_lengths > 0.05]
     x = x[moving]
     y = y[moving]
+    elapsed = elapsed[moving]
+    elapsed = np.maximum.accumulate(elapsed)
+    elapsed[0] = 0.0
+    elapsed[-1] = lap_time_ms
     cumulative = np.r_[0.0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
     total_distance = float(cumulative[-1])
     if total_distance <= 0:
@@ -566,13 +626,16 @@ def build_track_reference(
     resampled_distance = np.linspace(0.0, total_distance, points)
     resampled_x = np.interp(resampled_distance, cumulative, x)
     resampled_y = np.interp(resampled_distance, cumulative, y)
+    resampled_elapsed = np.interp(resampled_distance, cumulative, elapsed)
     return TrackReference(
         origin_latitude=origin_latitude,
         origin_longitude=origin_longitude,
         x_m=resampled_x,
         y_m=resampled_y,
         cumulative_m=resampled_distance,
+        elapsed_ms=resampled_elapsed,
         total_distance_m=total_distance,
+        lap_time_ms=lap_time_ms,
         lap=selected_lap,
         source=str(clean["Source"].iloc[0]) if "Source" in clean else "telemetry",
     )
@@ -603,6 +666,18 @@ class TelemetrySample:
     brake_temperature_est_pct: tuple[float, float, float, float]
     tire_slip_est_pct: tuple[float, float, float, float]
 
+    @property
+    def regen_kw(self) -> float:
+        """Positive regenerative power derived from Tesla's signed power channel."""
+
+        return max(0.0, -self.power_kw) if np.isfinite(self.power_kw) else float("nan")
+
+    @property
+    def total_g(self) -> float:
+        """Resultant planar acceleration from lateral and longitudinal channels."""
+
+        return float(np.hypot(self.lateral_g, self.longitudinal_g))
+
 
 class TelemetrySampler:
     """Efficient interpolation of prepared telemetry at video timestamps."""
@@ -618,31 +693,45 @@ class TelemetrySampler:
             if column in telemetry:
                 self._values[column] = telemetry[column].to_numpy(dtype=float)
 
-        self._interpolation: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._linear_values: dict[str, np.ndarray] = {}
         for column in LINEAR_CHANNELS:
             if column not in self._values:
                 continue
             values = self._values[column]
             finite = np.isfinite(values)
             if np.any(finite):
-                self._interpolation[column] = (self.times[finite], values[finite])
+                self._linear_values[column] = np.interp(
+                    self.times,
+                    self.times[finite],
+                    values[finite],
+                    left=values[finite][0],
+                    right=values[finite][-1],
+                )
 
-    def _linear(self, column: str, time_s: float) -> float:
-        values = self._interpolation.get(column)
+        self._held_values: dict[str, np.ndarray] = {}
+        row_indices = np.arange(len(telemetry), dtype=np.int64)
+        for column in HELD_CHANNELS:
+            if column not in self._values:
+                continue
+            values = self._values[column]
+            finite = np.isfinite(values)
+            previous = np.maximum.accumulate(np.where(finite, row_indices, -1))
+            held = np.full(len(values), np.nan, dtype=float)
+            valid = previous >= 0
+            held[valid] = values[previous[valid]]
+            self._held_values[column] = held
+
+    def _linear(self, column: str, lower: int, upper: int, fraction: float) -> float:
+        values = self._linear_values.get(column)
         if values is None:
             return float("nan")
-        times, channel = values
-        return float(np.interp(time_s, times, channel, left=channel[0], right=channel[-1]))
+        return float(values[lower] + (values[upper] - values[lower]) * fraction)
 
     def _held(self, column: str, index: int) -> float:
-        values = self._values.get(column)
+        values = self._held_values.get(column)
         if values is None:
             return float("nan")
-        value = float(values[index])
-        if np.isfinite(value):
-            return value
-        finite_indices = np.flatnonzero(np.isfinite(values[: index + 1]))
-        return float(values[finite_indices[-1]]) if len(finite_indices) else float("nan")
+        return float(values[index])
 
     @staticmethod
     def _thermal_percent(value: float) -> float:
@@ -654,12 +743,20 @@ class TelemetrySampler:
 
     def sample(self, video_time_s: float, *, sync_adjust_s: float = 0.0) -> TelemetrySample:
         session_time = self.sync.session_time_for_video(video_time_s, sync_adjust_s)
-        index = int(np.searchsorted(self.times, session_time, side="right") - 1)
-        index = int(np.clip(index, 0, len(self.times) - 1))
+        position = float(
+            np.clip(session_time * self.sync.sample_rate_hz, 0.0, len(self.times) - 1)
+        )
+        index = int(position)
+        upper = min(index + 1, len(self.times) - 1)
+        fraction = position - index
 
-        speed_mph = self._linear("Speed (MPH)", session_time)
-        lateral_ms2 = self._linear("Lateral Acceleration (m/s^2)", session_time)
-        longitudinal_ms2 = self._linear("Longitudinal Acceleration (m/s^2)", session_time)
+        speed_mph = self._linear("Speed (MPH)", index, upper, fraction)
+        lateral_ms2 = self._linear(
+            "Lateral Acceleration (m/s^2)", index, upper, fraction
+        )
+        longitudinal_ms2 = self._linear(
+            "Longitudinal Acceleration (m/s^2)", index, upper, fraction
+        )
         pressures = tuple(
             self._valid_pressure(self._held(column, index))
             for column in (
@@ -694,15 +791,24 @@ class TelemetrySampler:
             lap_elapsed_ms=max(0.0, self._held("Elapsed Time (ms)", index)),
             speed_mph=speed_mph,
             speed_kmh=speed_mph * 1.609344,
-            latitude=self._linear("Latitude (decimal)", session_time),
-            longitude=self._linear("Longitude (decimal)", session_time),
+            latitude=self._linear("Latitude (decimal)", index, upper, fraction),
+            longitude=self._linear("Longitude (decimal)", index, upper, fraction),
             lateral_g=lateral_ms2 / 9.80665,
             longitudinal_g=longitudinal_ms2 / 9.80665,
-            throttle_pct=float(np.clip(self._linear("Throttle Position (%)", session_time), 0, 100)),
-            brake_bar=max(0.0, self._linear("Brake Pressure (bar)", session_time)),
-            steering_deg=self._linear("Steering Angle (deg)", session_time),
-            yaw_rate=self._linear("Yaw Rate (rad/s)", session_time),
-            power_kw=self._linear("Power Level (KW)", session_time),
+            throttle_pct=float(
+                np.clip(
+                    self._linear("Throttle Position (%)", index, upper, fraction),
+                    0,
+                    100,
+                )
+            ),
+            brake_bar=max(
+                0.0,
+                self._linear("Brake Pressure (bar)", index, upper, fraction),
+            ),
+            steering_deg=self._linear("Steering Angle (deg)", index, upper, fraction),
+            yaw_rate=self._linear("Yaw Rate (rad/s)", index, upper, fraction),
+            power_kw=self._linear("Power Level (KW)", index, upper, fraction),
             state_of_charge_pct=self._held("State of Charge (%)", index),
             battery_thermal_pct=self._thermal_percent(self._held("Battery Temp (%)", index)),
             front_inverter_thermal_pct=self._thermal_percent(
@@ -726,6 +832,14 @@ def format_overlay_time(milliseconds: float) -> str:
     return f"{minutes}:{seconds:02d}.{millis:03d}"
 
 
+def format_overlay_delta(milliseconds: float) -> str:
+    """Format a live lap delta as signed seconds."""
+
+    if not np.isfinite(milliseconds):
+        return "--.---"
+    return f"{milliseconds / 1_000.0:+.3f}"
+
+
 @dataclass(frozen=True)
 class OverlayStyle:
     speed_unit: str = "km/h"
@@ -733,12 +847,56 @@ class OverlayStyle:
     show_tire_pressures: bool = False
     show_estimated_temperatures: bool = False
     max_brake_bar: float = 80.0
+    max_regen_kw: float = 200.0
     max_g: float = 1.5
     accent: tuple[int, int, int] = (250, 204, 21)
 
     def __post_init__(self) -> None:
         if self.speed_unit not in {"km/h", "MPH"}:
             raise ValueError("speed_unit must be 'km/h' or 'MPH'")
+        if self.max_brake_bar <= 0 or self.max_regen_kw <= 0 or self.max_g <= 0:
+            raise ValueError("HUD scale maxima must be positive")
+
+
+@dataclass(frozen=True)
+class _TrackScreenLayout:
+    offset_x: float
+    offset_y: float
+    scale: float
+    min_x: float
+    max_y: float
+    points: tuple[tuple[int, int], ...]
+    start: tuple[int, int]
+
+    def screen(self, x_m: float, y_m: float) -> tuple[int, int]:
+        return (
+            int(round(self.offset_x + (x_m - self.min_x) * self.scale)),
+            int(round(self.offset_y + (self.max_y - y_m) * self.scale)),
+        )
+
+
+@dataclass(frozen=True)
+class _RenderAssets:
+    scale: float
+    pad: int
+    font_tiny: ImageFont.ImageFont
+    font_small: ImageFont.ImageFont
+    font_medium: ImageFont.ImageFont
+    font_speed: ImageFont.ImageFont
+    speed_box: tuple[int, int, int, int]
+    track_box: tuple[int, int, int, int]
+    inputs_box: tuple[int, int, int, int]
+    dynamics_box: tuple[int, int, int, int]
+    thermal_box: tuple[int, int, int, int]
+    static_layers: tuple[tuple[tuple[int, int], Image.Image], ...]
+    track_layout: _TrackScreenLayout
+    track_line_width: int
+    input_rows_y: tuple[int, int, int]
+    input_bar_boxes: tuple[tuple[int, int, int, int], ...]
+    g_center: tuple[int, int]
+    g_radius: int
+    thermal_start: int
+    thermal_row_height: int
 
 
 class TelemetryOverlayRenderer:
@@ -748,6 +906,7 @@ class TelemetryOverlayRenderer:
         self.track = track
         self.style = style or OverlayStyle()
         self._font_cache: dict[tuple[int, bool], ImageFont.ImageFont] = {}
+        self._asset_cache: dict[tuple[int, int], _RenderAssets] = {}
 
     def _font(self, size: int, *, bold: bool = False) -> ImageFont.ImageFont:
         key = (size, bold)
@@ -799,7 +958,16 @@ class TelemetryOverlayRenderer:
             width=max(1, radius // 6),
         )
 
-    def _bar(
+    def _bar_background(
+        self,
+        draw: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+    ) -> None:
+        x0, y0, x1, y1 = box
+        radius = max(2, (y1 - y0) // 2)
+        draw.rounded_rectangle(box, radius=radius, fill=(51, 65, 85, 210))
+
+    def _bar_fill(
         self,
         draw: ImageDraw.ImageDraw,
         box: tuple[int, int, int, int],
@@ -809,21 +977,15 @@ class TelemetryOverlayRenderer:
         x0, y0, x1, y1 = box
         fraction = float(np.clip(fraction, 0.0, 1.0)) if np.isfinite(fraction) else 0.0
         radius = max(2, (y1 - y0) // 2)
-        draw.rounded_rectangle(box, radius=radius, fill=(51, 65, 85, 210))
         if fraction > 0:
             fill_x = max(x0 + 1, int(round(x0 + (x1 - x0) * fraction)))
             draw.rounded_rectangle(
                 (x0, y0, fill_x, y1), radius=radius, fill=(*color, 240)
             )
 
-    def _draw_track(
-        self,
-        draw: ImageDraw.ImageDraw,
-        box: tuple[int, int, int, int],
-        sample: TelemetrySample,
-        font_small: ImageFont.ImageFont,
-        line_width: int,
-    ) -> None:
+    def _track_screen_layout(
+        self, box: tuple[int, int, int, int]
+    ) -> _TrackScreenLayout:
         x0, y0, x1, y1 = box
         padding = max(8, int((x1 - x0) * 0.05))
         label_height = max(20, int((y1 - y0) * 0.15))
@@ -837,49 +999,34 @@ class TelemetryOverlayRenderer:
         scale = min(map_width / span_x, map_height / span_y)
         offset_x = map_box[0] + (map_width - span_x * scale) / 2
         offset_y = map_box[1] + (map_height - span_y * scale) / 2
-
-        def screen(x: float, y: float) -> tuple[int, int]:
-            return (
-                int(round(offset_x + (x - min_x) * scale)),
-                int(round(offset_y + (max_y - y) * scale)),
+        points = tuple(
+            (
+                int(round(offset_x + (float(x) - min_x) * scale)),
+                int(round(offset_y + (max_y - float(y)) * scale)),
             )
-
-        points = [screen(float(x), float(y)) for x, y in zip(self.track.x_m, self.track.y_m)]
-        if len(points) > 1:
-            draw.line(points, fill=(226, 232, 240, 235), width=line_width, joint="curve")
-        start = screen(float(self.track.x_m[0]), float(self.track.y_m[0]))
-        marker_radius = max(3, line_width)
-        draw.ellipse(
-            (start[0] - marker_radius, start[1] - marker_radius, start[0] + marker_radius, start[1] + marker_radius),
-            fill=(255, 255, 255, 255),
-            outline=(15, 23, 42, 255),
+            for x, y in zip(self.track.x_m, self.track.y_m)
+        )
+        return _TrackScreenLayout(
+            offset_x=offset_x,
+            offset_y=offset_y,
+            scale=scale,
+            min_x=min_x,
+            max_y=max_y,
+            points=points,
+            start=points[0],
         )
 
-        projection = self.track.project(sample.latitude, sample.longitude)
-        if np.isfinite(projection.x_m):
-            current = screen(projection.x_m, projection.y_m)
-            radius = max(6, line_width * 2)
-            draw.ellipse(
-                (current[0] - radius, current[1] - radius, current[0] + radius, current[1] + radius),
-                fill=(*self.style.accent, 255),
-                outline=(15, 23, 42, 255),
-                width=max(2, line_width // 2),
-            )
-            progress_text = f"TRACK  {projection.progress * 100:5.1f}%"
-        else:
-            progress_text = "TRACK  --.-%"
-        draw.text((x0 + padding, y0 + padding), progress_text, font=font_small, fill=(241, 245, 249, 255))
+    def _render_assets(self, width: int, height: int) -> _RenderAssets:
+        key = (width, height)
+        cached = self._asset_cache.get(key)
+        if cached is not None:
+            return cached
 
-    def render(self, image: Image.Image, sample: TelemetrySample) -> Image.Image:
-        base = image.convert("RGBA")
-        width, height = base.size
         scale = max(0.45, min(width / 1920.0, height / 1080.0))
         margin = max(12, int(round(min(width, height) * 0.025)))
         gap = max(8, int(round(14 * scale)))
         radius = max(8, int(round(14 * scale)))
-        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay, "RGBA")
-
+        pad = max(8, int(round(15 * scale)))
         font_tiny = self._font(max(10, int(round(17 * scale))))
         font_small = self._font(max(12, int(round(23 * scale))), bold=True)
         font_medium = self._font(max(14, int(round(32 * scale))), bold=True)
@@ -919,11 +1066,175 @@ class TelemetryOverlayRenderer:
             width - margin,
             bottom_y,
         )
-        for box in (speed_box, track_box, inputs_box, dynamics_box, thermal_box):
+        panel_boxes = (speed_box, track_box, inputs_box, dynamics_box, thermal_box)
+
+        static = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(static, "RGBA")
+        for box in panel_boxes:
             self._panel(draw, box, radius)
 
+        track_layout = self._track_screen_layout(track_box)
+        track_line_width = max(3, int(round(5 * scale)))
+        if len(track_layout.points) > 1:
+            draw.line(
+                track_layout.points,
+                fill=(226, 232, 240, 235),
+                width=track_line_width,
+                joint="curve",
+            )
+        start = track_layout.start
+        start_radius = max(3, track_line_width)
+        draw.ellipse(
+            (
+                start[0] - start_radius,
+                start[1] - start_radius,
+                start[0] + start_radius,
+                start[1] + start_radius,
+            ),
+            fill=(255, 255, 255, 255),
+            outline=(15, 23, 42, 255),
+        )
+
+        ix0, iy0, ix1, iy1 = inputs_box
+        label_x = ix0 + pad
+        bar_x0 = ix0 + int((ix1 - ix0) * 0.31)
+        bar_x1 = ix1 - pad
+        row_height = max(1, (iy1 - iy0 - 2 * pad) // 3)
+        input_rows_y = tuple(iy0 + pad + row * row_height for row in range(3))
+        bar_offset = max(1, int(round(3 * scale)))
+        bar_height = max(6, min(int(round(14 * scale)), row_height - bar_offset))
+        input_bar_boxes = tuple(
+            (bar_x0, y + bar_offset, bar_x1, y + bar_offset + bar_height)
+            for y in input_rows_y
+        )
+        for y, label, bar_box in zip(
+            input_rows_y,
+            ("THROTTLE", "BRAKE", "REGEN"),
+            input_bar_boxes,
+        ):
+            draw.text((label_x, y), label, font=font_tiny, fill=(226, 232, 240, 255))
+            self._bar_background(draw, bar_box)
+
+        dx0, dy0, dx1, dy1 = dynamics_box
+        draw.text(
+            (dx0 + pad, dy0 + pad),
+            "POWER",
+            font=font_tiny,
+            fill=(203, 213, 225, 255),
+        )
+        center_x = dx1 - pad - int((dy1 - dy0) * 0.35)
+        center_y = (dy0 + dy1) // 2
+        g_radius = max(18, int((dy1 - dy0) * 0.29))
+        draw.ellipse(
+            (
+                center_x - g_radius,
+                center_y - g_radius,
+                center_x + g_radius,
+                center_y + g_radius,
+            ),
+            outline=(148, 163, 184, 220),
+            width=max(1, int(round(2 * scale))),
+        )
+        draw.line(
+            (center_x - g_radius, center_y, center_x + g_radius, center_y),
+            fill=(71, 85, 105, 220),
+        )
+        draw.line(
+            (center_x, center_y - g_radius, center_x, center_y + g_radius),
+            fill=(71, 85, 105, 220),
+        )
+
+        tx0, ty0, _, _ = thermal_box
+        draw.text(
+            (tx0 + pad, ty0 + pad),
+            "THERMAL LOAD",
+            font=font_tiny,
+            fill=(203, 213, 225, 255),
+        )
+        thermal_row_height = max(18, int(round(27 * scale)))
+        thermal_start = ty0 + pad + int(round(25 * scale))
+        for row, label in enumerate(("BATTERY", "FRONT INV", "REAR INV")):
+            draw.text(
+                (tx0 + pad, thermal_start + row * thermal_row_height),
+                label,
+                font=font_tiny,
+                fill=(226, 232, 240, 255),
+            )
+
+        static_layers = tuple(
+            (
+                (box[0], box[1]),
+                static.crop((box[0], box[1], box[2] + 1, box[3] + 1)),
+            )
+            for box in panel_boxes
+        )
+        assets = _RenderAssets(
+            scale=scale,
+            pad=pad,
+            font_tiny=font_tiny,
+            font_small=font_small,
+            font_medium=font_medium,
+            font_speed=font_speed,
+            speed_box=speed_box,
+            track_box=track_box,
+            inputs_box=inputs_box,
+            dynamics_box=dynamics_box,
+            thermal_box=thermal_box,
+            static_layers=static_layers,
+            track_layout=track_layout,
+            track_line_width=track_line_width,
+            input_rows_y=input_rows_y,  # type: ignore[arg-type]
+            input_bar_boxes=input_bar_boxes,
+            g_center=(center_x, center_y),
+            g_radius=g_radius,
+            thermal_start=thermal_start,
+            thermal_row_height=thermal_row_height,
+        )
+        self._asset_cache[key] = assets
+        return assets
+
+    def panel_boxes(
+        self, image_size: tuple[int, int]
+    ) -> dict[str, tuple[int, int, int, int]]:
+        """Return fixed HUD panel coordinates for layout regression checks."""
+
+        assets = self._render_assets(*image_size)
+        return {
+            "speed": assets.speed_box,
+            "track": assets.track_box,
+            "inputs": assets.inputs_box,
+            "dynamics": assets.dynamics_box,
+            "thermal": assets.thermal_box,
+        }
+
+    def render(
+        self,
+        image: Image.Image,
+        sample: TelemetrySample,
+        *,
+        copy_image: bool = True,
+    ) -> Image.Image:
+        if image.mode == "RGB":
+            base = image.copy() if copy_image else image
+        else:
+            base = image.convert("RGB")
+        width, height = base.size
+        assets = self._render_assets(width, height)
+        for destination, layer in assets.static_layers:
+            base.paste(layer, destination, layer)
+        draw = ImageDraw.Draw(base, "RGBA")
+
+        scale = assets.scale
+        pad = assets.pad
+        font_tiny = assets.font_tiny
+        font_small = assets.font_small
+        font_medium = assets.font_medium
+        font_speed = assets.font_speed
+        speed_box = assets.speed_box
+        track_box = assets.track_box
+        projection = self.track.project(sample.latitude, sample.longitude)
+
         # Speed and lap clock.
-        pad = max(8, int(round(15 * scale)))
         speed = sample.speed_kmh if self.style.speed_unit == "km/h" else sample.speed_mph
         speed_text = self._fmt(speed, ".0f")
         draw.text(
@@ -948,36 +1259,79 @@ class TelemetryOverlayRenderer:
             fill=(*self.style.accent, 255),
         )
 
-        self._draw_track(
-            draw,
-            track_box,
-            sample,
-            font_small,
-            max(3, int(round(5 * scale))),
+        delta_ms = (
+            self.track.delta_to_reference_ms(sample.lap_elapsed_ms, projection)
+            if sample.lap > 0
+            else float("nan")
+        )
+        best_y = speed_box[3] - pad - int(52 * scale)
+        draw.text(
+            (speed_box[0] + pad, best_y),
+            f"BEST {format_overlay_time(self.track.lap_time_ms)}",
+            font=font_tiny,
+            fill=(203, 213, 225, 255),
+        )
+        delta_color = (
+            (148, 163, 184)
+            if not np.isfinite(delta_ms)
+            else (34, 197, 94)
+            if delta_ms <= 0
+            else (248, 113, 113)
+        )
+        draw.text(
+            (speed_box[2] - pad, best_y),
+            f"DELTA {format_overlay_delta(delta_ms)}",
+            font=font_tiny,
+            fill=(*delta_color, 255),
+            anchor="ra",
+        )
+
+        track_padding = max(8, int((track_box[2] - track_box[0]) * 0.05))
+        if np.isfinite(projection.x_m):
+            current = assets.track_layout.screen(projection.x_m, projection.y_m)
+            marker_radius = max(6, assets.track_line_width * 2)
+            draw.ellipse(
+                (
+                    current[0] - marker_radius,
+                    current[1] - marker_radius,
+                    current[0] + marker_radius,
+                    current[1] + marker_radius,
+                ),
+                fill=(*self.style.accent, 255),
+                outline=(15, 23, 42, 255),
+                width=max(2, assets.track_line_width // 2),
+            )
+            progress_text = f"TRACK  {projection.progress * 100:5.1f}%"
+        else:
+            progress_text = "TRACK  --.-%"
+        draw.text(
+            (track_box[0] + track_padding, track_box[1] + track_padding),
+            progress_text,
+            font=font_small,
+            fill=(241, 245, 249, 255),
         )
 
         # Driver inputs.
-        ix0, iy0, ix1, iy1 = inputs_box
-        label_x = ix0 + pad
-        bar_x0 = ix0 + int((ix1 - ix0) * 0.31)
-        bar_x1 = ix1 - pad
-        row_height = (iy1 - iy0 - 2 * pad) // 2
-        throttle_y = iy0 + pad
-        brake_y = throttle_y + row_height
-        draw.text((label_x, throttle_y), "THROTTLE", font=font_tiny, fill=(226, 232, 240, 255))
-        draw.text((label_x, brake_y), "BRAKE", font=font_tiny, fill=(226, 232, 240, 255))
-        bar_height = max(8, int(round(16 * scale)))
-        self._bar(
+        throttle_y, brake_y, regen_y = assets.input_rows_y
+        throttle_box, brake_box, regen_box = assets.input_bar_boxes
+        bar_x1 = throttle_box[2]
+        self._bar_fill(
             draw,
-            (bar_x0, throttle_y + int(4 * scale), bar_x1, throttle_y + int(4 * scale) + bar_height),
+            throttle_box,
             sample.throttle_pct / 100.0,
             (34, 197, 94),
         )
-        self._bar(
+        self._bar_fill(
             draw,
-            (bar_x0, brake_y + int(4 * scale), bar_x1, brake_y + int(4 * scale) + bar_height),
+            brake_box,
             sample.brake_bar / self.style.max_brake_bar,
             (239, 68, 68),
+        )
+        self._bar_fill(
+            draw,
+            regen_box,
+            sample.regen_kw / self.style.max_regen_kw,
+            (56, 189, 248),
         )
         draw.text(
             (bar_x1, throttle_y),
@@ -993,28 +1347,47 @@ class TelemetryOverlayRenderer:
             fill=(241, 245, 249, 255),
             anchor="ra",
         )
+        draw.text(
+            (bar_x1, regen_y),
+            f" {self._fmt(sample.regen_kw, '.0f')} kW",
+            font=font_tiny,
+            fill=(241, 245, 249, 255),
+            anchor="ra",
+        )
 
         # Power and g meter.
-        dx0, dy0, dx1, dy1 = dynamics_box
-        draw.text((dx0 + pad, dy0 + pad), "POWER", font=font_tiny, fill=(203, 213, 225, 255))
+        dx0, dy0, _, _ = assets.dynamics_box
         power_text = self._fmt(sample.power_kw, "+.0f") + " kW"
-        power_color = (249, 115, 22) if sample.power_kw >= 0 else (56, 189, 248)
+        power_color = (
+            (148, 163, 184)
+            if not np.isfinite(sample.power_kw)
+            else (249, 115, 22)
+            if sample.power_kw >= 0
+            else (56, 189, 248)
+        )
         draw.text(
             (dx0 + pad, dy0 + pad + int(24 * scale)),
             power_text,
             font=font_medium,
             fill=(*power_color, 255),
         )
-        center_x = dx1 - pad - int((dy1 - dy0) * 0.35)
-        center_y = (dy0 + dy1) // 2
-        g_radius = max(18, int((dy1 - dy0) * 0.29))
-        draw.ellipse(
-            (center_x - g_radius, center_y - g_radius, center_x + g_radius, center_y + g_radius),
-            outline=(148, 163, 184, 220),
-            width=max(1, int(round(2 * scale))),
+        draw.text(
+            (dx0 + pad, dy0 + pad + int(66 * scale)),
+            f"G  {self._fmt(sample.total_g, '.2f')}",
+            font=font_small,
+            fill=(241, 245, 249, 255),
         )
-        draw.line((center_x - g_radius, center_y, center_x + g_radius, center_y), fill=(71, 85, 105, 220))
-        draw.line((center_x, center_y - g_radius, center_x, center_y + g_radius), fill=(71, 85, 105, 220))
+        draw.text(
+            (dx0 + pad, dy0 + pad + int(96 * scale)),
+            (
+                f"LAT {self._fmt(sample.lateral_g, '+.2f')}  "
+                f"LONG {self._fmt(sample.longitudinal_g, '+.2f')}"
+            ),
+            font=font_tiny,
+            fill=(203, 213, 225, 255),
+        )
+        center_x, center_y = assets.g_center
+        g_radius = assets.g_radius
         dot_x = center_x + int(np.clip(sample.lateral_g / self.style.max_g, -1, 1) * g_radius)
         dot_y = center_y - int(np.clip(sample.longitudinal_g / self.style.max_g, -1, 1) * g_radius)
         dot_radius = max(4, int(round(6 * scale)))
@@ -1024,18 +1397,14 @@ class TelemetryOverlayRenderer:
         )
 
         # Thermal block. These are normalized Tesla thermal indicators, not °C.
-        tx0, ty0, tx1, ty1 = thermal_box
-        draw.text((tx0 + pad, ty0 + pad), "THERMAL LOAD", font=font_tiny, fill=(203, 213, 225, 255))
+        tx0, _, tx1, _ = assets.thermal_box
         thermal_rows = (
-            ("BATTERY", sample.battery_thermal_pct),
-            ("FRONT INV", sample.front_inverter_thermal_pct),
-            ("REAR INV", sample.rear_inverter_thermal_pct),
+            sample.battery_thermal_pct,
+            sample.front_inverter_thermal_pct,
+            sample.rear_inverter_thermal_pct,
         )
-        thermal_row_height = max(18, int(round(27 * scale)))
-        thermal_start = ty0 + pad + int(round(25 * scale))
-        for row, (label, value) in enumerate(thermal_rows):
-            y = thermal_start + row * thermal_row_height
-            draw.text((tx0 + pad, y), label, font=font_tiny, fill=(226, 232, 240, 255))
+        for row, value in enumerate(thermal_rows):
+            y = assets.thermal_start + row * assets.thermal_row_height
             draw.text(
                 (tx1 - pad, y),
                 self._fmt(value, ".0f") + ("%" if np.isfinite(value) else ""),
@@ -1044,7 +1413,7 @@ class TelemetryOverlayRenderer:
                 anchor="ra",
             )
         soc_text = self._fmt(sample.state_of_charge_pct, ".1f")
-        detail_y = thermal_start + len(thermal_rows) * thermal_row_height
+        detail_y = assets.thermal_start + len(thermal_rows) * assets.thermal_row_height
         draw.text(
             (tx0 + pad, detail_y),
             f"SOC  {soc_text}%",
@@ -1056,7 +1425,7 @@ class TelemetryOverlayRenderer:
             pressure_text = "  ".join(
                 self._fmt(value, ".2f") for value in sample.tire_pressures_bar
             )
-            detail_y += thermal_row_height
+            detail_y += assets.thermal_row_height
             draw.text(
                 (tx0 + pad, detail_y),
                 f"TYRES  {pressure_text} bar",
@@ -1065,7 +1434,7 @@ class TelemetryOverlayRenderer:
             )
 
         if self.style.show_estimated_temperatures:
-            detail_y += thermal_row_height
+            detail_y += assets.thermal_row_height
             brake_text = "  ".join(
                 self._fmt(value, ".0f") for value in sample.brake_temperature_est_pct
             )
@@ -1076,7 +1445,7 @@ class TelemetryOverlayRenderer:
                 fill=(226, 232, 240, 255),
             )
 
-        return Image.alpha_composite(base, overlay).convert("RGB")
+        return base
 
 
 def _frame_time_seconds(frame: Any, stream: Any, fallback_index: int) -> float:
@@ -1103,13 +1472,16 @@ def _frame_to_image(frame: Any, target_size: tuple[int, int]) -> Image.Image:
     """Convert a video frame after resizing through FFmpeg's native scaler."""
 
     target_width, target_height = target_size
-    if frame.width != target_width or frame.height != target_height:
-        frame = frame.reformat(
+    if frame.width == target_width and frame.height == target_height:
+        pixels = frame.to_ndarray(format="rgb24")
+    else:
+        pixels = frame.to_ndarray(
             width=target_width,
             height=target_height,
             format="rgb24",
+            interpolation="BILINEAR",
         )
-    return frame.to_image().convert("RGB")
+    return Image.fromarray(pixels)
 
 
 @dataclass(frozen=True)
@@ -1153,7 +1525,7 @@ def render_overlay_preview(
             image = _frame_to_image(frame, target_size)
             sample = sampler.sample(actual_time, sync_adjust_s=sync_adjust_s)
             return PreviewResult(
-                image=renderer.render(image, sample),
+                image=renderer.render(image, sample, copy_image=False),
                 requested_time_s=float(video_time_s),
                 actual_time_s=actual_time,
                 sample=sample,
@@ -1266,8 +1638,12 @@ def render_overlay_video(
 
             image = _frame_to_image(frame, (target_width, target_height))
             sample = sampler.sample(frame_time, sync_adjust_s=sync_adjust_s)
-            rendered = renderer.render(image, sample)
-            output_frame = av.VideoFrame.from_image(rendered)
+            rendered = renderer.render(image, sample, copy_image=False)
+            rendered_pixels = np.asarray(rendered)
+            output_frame = av.VideoFrame.from_numpy_buffer(
+                rendered_pixels,
+                format="rgb24",
+            )
             output_frame.pts = frames_written
             output_frame.time_base = output_time_base
             for packet in output_stream.encode(output_frame):
@@ -1349,6 +1725,7 @@ __all__ = [
     "choose_reference_lap",
     "discover_recording_pairs",
     "estimate_lap_sample_rate_hz",
+    "format_overlay_delta",
     "format_overlay_time",
     "load_overlay_telemetry",
     "probe_video",
