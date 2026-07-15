@@ -1099,6 +1099,19 @@ def _target_dimensions(width: int, height: int, output_width: int | None) -> tup
     return target_width, target_height
 
 
+def _frame_to_image(frame: Any, target_size: tuple[int, int]) -> Image.Image:
+    """Convert a video frame after resizing through FFmpeg's native scaler."""
+
+    target_width, target_height = target_size
+    if frame.width != target_width or frame.height != target_height:
+        frame = frame.reformat(
+            width=target_width,
+            height=target_height,
+            format="rgb24",
+        )
+    return frame.to_image().convert("RGB")
+
+
 @dataclass(frozen=True)
 class PreviewResult:
     image: Image.Image
@@ -1136,10 +1149,8 @@ def render_overlay_preview(
             actual_time = _frame_time_seconds(frame, stream, index)
             if actual_time + 1e-9 < video_time_s:
                 continue
-            image = frame.to_image().convert("RGB")
-            target_size = _target_dimensions(image.width, image.height, output_width)
-            if image.size != target_size:
-                image = image.resize(target_size, Image.Resampling.LANCZOS)
+            target_size = _target_dimensions(frame.width, frame.height, output_width)
+            image = _frame_to_image(frame, target_size)
             sample = sampler.sample(actual_time, sync_adjust_s=sync_adjust_s)
             return PreviewResult(
                 image=renderer.render(image, sample),
@@ -1208,16 +1219,25 @@ def render_overlay_video(
             source_width, source_height, output_width
         )
         input_rate = input_stream.average_rate or Fraction(36, 1)
+        # Tesla's Track Mode video uses slightly irregular presentation
+        # intervals.  Feeding those timestamps into an encoder configured at
+        # the average frame rate can round two adjacent frames onto the same
+        # encoder tick and eventually make the MP4 muxer reject a packet.
+        # Keep telemetry sampling on the source PTS, but normalize the output
+        # to a close milliframe-rate CFR for strictly increasing encode PTS.
+        output_rate = Fraction(round(float(input_rate) * 1_000), 1_000)
+        output_time_base = Fraction(output_rate.denominator, output_rate.numerator)
         input_time_base = input_stream.time_base or Fraction(1, 10_000)
 
         output_container = av.open(
             str(destination), "w", options={"movflags": "+faststart"}
         )
-        output_stream = output_container.add_stream(codec, rate=input_rate)
+        output_stream = output_container.add_stream(codec, rate=output_rate)
         output_stream.width = target_width
         output_stream.height = target_height
         output_stream.pix_fmt = "yuv420p"
-        output_stream.time_base = input_time_base
+        output_stream.time_base = output_time_base
+        output_stream.codec_context.time_base = output_time_base
         output_stream.options = {"crf": str(int(crf)), "preset": str(preset)}
 
         if input_stream.time_base and start_s > 0:
@@ -1244,16 +1264,12 @@ def render_overlay_video(
             if first_time is None:
                 first_time = frame_time
 
-            image = frame.to_image().convert("RGB")
-            if image.size != (target_width, target_height):
-                image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            image = _frame_to_image(frame, (target_width, target_height))
             sample = sampler.sample(frame_time, sync_adjust_s=sync_adjust_s)
             rendered = renderer.render(image, sample)
             output_frame = av.VideoFrame.from_image(rendered)
-            output_frame.pts = int(
-                round((frame_time - first_time) / float(input_time_base))
-            )
-            output_frame.time_base = input_time_base
+            output_frame.pts = frames_written
+            output_frame.time_base = output_time_base
             for packet in output_stream.encode(output_frame):
                 output_container.mux(packet)
 

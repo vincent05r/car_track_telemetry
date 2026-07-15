@@ -2,7 +2,7 @@
 
 The data-processing functions in this module are deliberately independent from
 the notebook so they can be tested and reused from scripts.  ``TelemetryDashboard``
-adds the Jupyter-specific controls and synchronized Matplotlib views.
+adds Jupyter controls and a synchronized Vega-Lite telemetry view.
 """
 
 from __future__ import annotations
@@ -11,12 +11,9 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from IPython.display import clear_output, display
-from matplotlib.collections import LineCollection
+from IPython.display import display
 import ipywidgets as widgets
 
 
@@ -309,6 +306,402 @@ def _channel(lap_data: pd.DataFrame, name: str) -> np.ndarray:
     return np.full(len(lap_data), np.nan, dtype=float)
 
 
+def _json_values(values: np.ndarray, decimals: int = 6) -> list[float | None]:
+    rounded = np.round(np.asarray(values, dtype=float), decimals)
+    return [float(value) if np.isfinite(value) else None for value in rounded]
+
+
+def build_telemetry_plot_spec(
+    lap_data: pd.DataFrame,
+    *,
+    title: str,
+    speed_unit: str,
+) -> dict[str, Any]:
+    """Build a self-contained Vega-Lite v5 specification for one lap.
+
+    VS Code bundles the Vega-Lite renderer with its Jupyter renderer extension,
+    so this view does not require ipympl, a widget CDN, or custom JavaScript.
+    """
+
+    if lap_data.empty:
+        raise ValueError("Cannot plot an empty lap")
+    if speed_unit not in {"km/h", "MPH"}:
+        raise ValueError("speed_unit must be 'km/h' or 'MPH'")
+
+    speed_column = "Speed (km/h)" if speed_unit == "km/h" else "Speed (MPH)"
+    latitude = lap_data["Latitude (decimal)"].to_numpy(dtype=float)
+    longitude = lap_data["Longitude (decimal)"].to_numpy(dtype=float)
+    mean_latitude = float(np.nanmean(latitude))
+    mean_longitude = float(np.nanmean(longitude))
+    latitude_scale = np.pi * EARTH_RADIUS_M / 180.0
+    longitude_scale = latitude_scale * np.cos(np.radians(mean_latitude))
+    east_m = (longitude - mean_longitude) * longitude_scale
+    north_m = (latitude - mean_latitude) * latitude_scale
+
+    channels = {
+        "time_s": _json_values(lap_data["Elapsed (s)"].to_numpy(dtype=float), 3),
+        "distance_m": _json_values(lap_data["GPS Distance (m)"].to_numpy(dtype=float), 1),
+        "speed": _json_values(_channel(lap_data, speed_column), 2),
+        "throttle": _json_values(_channel(lap_data, "Throttle Position (%)"), 2),
+        "brake": _json_values(
+            np.clip(_channel(lap_data, "Brake Pressure (bar)"), 0.0, None), 2
+        ),
+        "lateral_g": _json_values(_channel(lap_data, "Lateral Acceleration (g)"), 3),
+        "longitudinal_g": _json_values(
+            _channel(lap_data, "Longitudinal Acceleration (g)"), 3
+        ),
+        "power": _json_values(_channel(lap_data, "Power Level (KW)"), 2),
+        "steering": _json_values(_channel(lap_data, "Steering Angle (deg)"), 2),
+        "east_m": _json_values(east_m, 2),
+        "north_m": _json_values(north_m, 2),
+        "longitude": _json_values(longitude, 7),
+        "latitude": _json_values(latitude, 7),
+    }
+    records = [
+        {"sample": index, **{name: values[index] for name, values in channels.items()}}
+        for index in range(len(lap_data))
+    ]
+
+    chart_width = 960
+    x_span = max(float(np.nanmax(east_m) - np.nanmin(east_m)), 1.0)
+    y_span = max(float(np.nanmax(north_m) - np.nanmin(north_m)), 1.0)
+    track_height = int(np.clip(chart_width * y_span / x_span, 330, 600))
+    x_padding = max(x_span * 0.06, 2.0)
+    y_padding = max(y_span * 0.06, 2.0)
+    east_domain = [
+        float(np.nanmin(east_m) - x_padding),
+        float(np.nanmax(east_m) + x_padding),
+    ]
+    north_domain = [
+        float(np.nanmin(north_m) - y_padding),
+        float(np.nanmax(north_m) + y_padding),
+    ]
+
+    time_encoding = {
+        "field": "time_s",
+        "type": "quantitative",
+        "title": "Elapsed lap time (s)",
+        "scale": {"zero": False},
+    }
+    cursor_filter = {"filter": {"param": "telemetry_cursor", "empty": False}}
+    cursor_rule = {
+        "transform": [cursor_filter],
+        "mark": {"type": "rule", "color": "#f59e0b", "strokeWidth": 2},
+        "encoding": {"x": time_encoding},
+    }
+
+    def single_channel_chart(
+        field: str,
+        chart_title: str,
+        axis_title: str,
+        colour: str,
+        *,
+        height: int = 150,
+    ) -> dict[str, Any]:
+        return {
+            "width": chart_width,
+            "height": height,
+            "title": chart_title,
+            "layer": [
+                {
+                    "mark": {"type": "line", "color": colour, "strokeWidth": 1.6},
+                    "encoding": {
+                        "x": time_encoding,
+                        "y": {
+                            "field": field,
+                            "type": "quantitative",
+                            "title": axis_title,
+                            "scale": {"zero": False},
+                        },
+                    },
+                },
+                cursor_rule,
+                {
+                    "transform": [cursor_filter],
+                    "mark": {
+                        "type": "point",
+                        "filled": True,
+                        "color": colour,
+                        "stroke": "white",
+                        "strokeWidth": 1,
+                        "size": 75,
+                    },
+                    "encoding": {
+                        "x": time_encoding,
+                        "y": {"field": field, "type": "quantitative"},
+                    },
+                },
+            ],
+        }
+
+    def folded_chart(
+        fields: list[str],
+        labels: list[str],
+        colours: list[str],
+        chart_title: str,
+        axis_title: str,
+    ) -> dict[str, Any]:
+        colour_encoding = {
+            "field": "channel",
+            "type": "nominal",
+            "title": None,
+            "scale": {"domain": fields, "range": colours},
+            "legend": {
+                "orient": "top-right",
+                "labelExpr": "{" + ",".join(
+                    f"'{field}':'{label}'" for field, label in zip(fields, labels)
+                ) + "}[datum.label]",
+            },
+        }
+        fold = {"fold": fields, "as": ["channel", "value"]}
+        return {
+            "width": chart_width,
+            "height": 135,
+            "title": chart_title,
+            "layer": [
+                {
+                    "transform": [fold],
+                    "mark": {"type": "line", "strokeWidth": 1.35},
+                    "encoding": {
+                        "x": time_encoding,
+                        "y": {
+                            "field": "value",
+                            "type": "quantitative",
+                            "title": axis_title,
+                            "scale": {"zero": False},
+                        },
+                        "color": colour_encoding,
+                    },
+                },
+                cursor_rule,
+                {
+                    "transform": [cursor_filter, fold],
+                    "mark": {
+                        "type": "point",
+                        "filled": True,
+                        "stroke": "white",
+                        "strokeWidth": 1,
+                        "size": 65,
+                    },
+                    "encoding": {
+                        "x": time_encoding,
+                        "y": {"field": "value", "type": "quantitative"},
+                        "color": colour_encoding,
+                    },
+                },
+            ],
+        }
+
+    track_x = {
+        "field": "east_m",
+        "type": "quantitative",
+        "title": "East from lap centre (m)",
+        "scale": {"domain": east_domain, "nice": False, "zero": False},
+    }
+    track_y = {
+        "field": "north_m",
+        "type": "quantitative",
+        "title": "North from lap centre (m)",
+        "scale": {"domain": north_domain, "nice": False, "zero": False},
+    }
+    tooltip = [
+        {"field": "time_s", "type": "quantitative", "title": "Lap time (s)", "format": ".3f"},
+        {"field": "distance_m", "type": "quantitative", "title": "Distance (m)", "format": ".0f"},
+        {
+            "field": "speed",
+            "type": "quantitative",
+            "title": f"Speed ({speed_unit})",
+            "format": ".1f",
+        },
+        {"field": "throttle", "type": "quantitative", "title": "Throttle (%)", "format": ".1f"},
+        {"field": "brake", "type": "quantitative", "title": "Brake (bar)", "format": ".1f"},
+        {"field": "lateral_g", "type": "quantitative", "title": "Lateral (g)", "format": "+.2f"},
+        {
+            "field": "longitudinal_g",
+            "type": "quantitative",
+            "title": "Longitudinal (g)",
+            "format": "+.2f",
+        },
+        {"field": "power", "type": "quantitative", "title": "Power (kW)", "format": "+.1f"},
+        {"field": "steering", "type": "quantitative", "title": "Steering (deg)", "format": "+.1f"},
+        {"field": "latitude", "type": "quantitative", "title": "Latitude", "format": ".6f"},
+        {"field": "longitude", "type": "quantitative", "title": "Longitude", "format": ".6f"},
+    ]
+    last_sample = len(records) - 1
+    track_chart = {
+        "width": chart_width,
+        "height": track_height,
+        "title": "Track map — move or drag the pointer along the trace",
+        "layer": [
+            {
+                "mark": {
+                    "type": "line",
+                    "color": "#94a3b8",
+                    "strokeWidth": 5,
+                    "strokeCap": "round",
+                    "strokeJoin": "round",
+                },
+                "encoding": {
+                    "x": track_x,
+                    "y": track_y,
+                    "order": {"field": "sample", "type": "quantitative"},
+                },
+            },
+            {
+                "mark": {"type": "point", "filled": True, "size": 16, "opacity": 0.8},
+                "encoding": {
+                    "x": track_x,
+                    "y": track_y,
+                    "color": {
+                        "field": "speed",
+                        "type": "quantitative",
+                        "title": f"Speed ({speed_unit})",
+                        "scale": {"scheme": "turbo"},
+                    },
+                },
+            },
+            {
+                "params": [
+                    {
+                        "name": "telemetry_cursor",
+                        "value": [{"sample": 0}],
+                        "select": {
+                            "type": "point",
+                            "fields": ["sample"],
+                            "on": "pointermove",
+                            "nearest": True,
+                            "clear": False,
+                            "toggle": False,
+                        },
+                    }
+                ],
+                "mark": {"type": "point", "filled": True, "size": 110, "opacity": 0.001},
+                "encoding": {"x": track_x, "y": track_y, "tooltip": tooltip},
+            },
+            {
+                "transform": [{"filter": "datum.sample === 0"}],
+                "mark": {
+                    "type": "point",
+                    "filled": True,
+                    "size": 90,
+                    "color": "white",
+                    "stroke": "#111827",
+                    "strokeWidth": 2,
+                },
+                "encoding": {"x": track_x, "y": track_y},
+            },
+            {
+                "transform": [{"filter": f"datum.sample === {last_sample}"}],
+                "mark": {
+                    "type": "point",
+                    "filled": True,
+                    "shape": "cross",
+                    "size": 120,
+                    "color": "#111827",
+                },
+                "encoding": {"x": track_x, "y": track_y},
+            },
+            {
+                "transform": [cursor_filter],
+                "mark": {
+                    "type": "point",
+                    "filled": True,
+                    "size": 260,
+                    "color": "#facc15",
+                    "stroke": "#111827",
+                    "strokeWidth": 2.5,
+                },
+                "encoding": {"x": track_x, "y": track_y, "tooltip": tooltip},
+            },
+            {
+                "transform": [
+                    cursor_filter,
+                    {
+                        "calculate": (
+                            f"'t ' + format(datum.time_s, '.3f') + ' s · ' + "
+                            f"format(datum.speed, '.1f') + ' {speed_unit}'"
+                        ),
+                        "as": "cursor_label",
+                    },
+                ],
+                "mark": {
+                    "type": "text",
+                    "align": "left",
+                    "dx": 13,
+                    "dy": -13,
+                    "fontSize": 12,
+                    "fontWeight": "bold",
+                    "color": "#111827",
+                },
+                "encoding": {
+                    "x": track_x,
+                    "y": track_y,
+                    "text": {"field": "cursor_label", "type": "nominal"},
+                },
+            },
+        ],
+    }
+
+    return {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "description": "Linked Tesla Track Mode telemetry and GPS trace.",
+        "data": {"values": records},
+        "vconcat": [
+            single_channel_chart(
+                "speed",
+                f"{title} — Speed",
+                f"Speed ({speed_unit})",
+                "#1d4ed8",
+            ),
+            folded_chart(
+                ["throttle", "brake"],
+                ["Throttle (%)", "Brake (bar)"],
+                ["#15803d", "#dc2626"],
+                "Driver inputs",
+                "Percent / bar",
+            ),
+            folded_chart(
+                ["lateral_g", "longitudinal_g"],
+                ["Lateral", "Longitudinal"],
+                ["#7c3aed", "#0891b2"],
+                "Vehicle dynamics",
+                "Acceleration (g)",
+            ),
+            folded_chart(
+                ["power", "steering"],
+                ["Power (kW)", "Steering (deg)"],
+                ["#ea580c", "#475569"],
+                "Power and steering",
+                "kW / degrees",
+            ),
+            track_chart,
+        ],
+        "spacing": 12,
+        "resolve": {"scale": {"color": "independent"}},
+        "config": {
+            "background": "white",
+            "view": {"stroke": "#d8dee5"},
+            "axis": {
+                "gridColor": "#e5e7eb",
+                "domainColor": "#94a3b8",
+                "labelColor": "#334e68",
+                "titleColor": "#243b53",
+            },
+            "title": {
+                "anchor": "start",
+                "color": "#243b53",
+                "font": "system-ui",
+                "fontSize": 14,
+            },
+            "legend": {
+                "labelColor": "#334e68",
+                "titleColor": "#243b53",
+                "orient": "right",
+            },
+        },
+    }
+
+
 class TelemetryDashboard:
     """Jupyter dashboard with session/lap selectors and a draggable GPS handle."""
 
@@ -329,15 +722,9 @@ class TelemetryDashboard:
         self.lap_summary = pd.DataFrame()
         self.lap_data = pd.DataFrame()
         self.current_index = 0
-        self.fig: Any | None = None
-        self.ax_track: Any | None = None
-        self.position_handle: Any | None = None
-        self._connection_ids: list[int] = []
-        self._cursor_lines: list[Any] = []
-        self._value_markers: list[tuple[Any, np.ndarray]] = []
-        self._dragging = False
+        self.plot_spec: dict[str, Any] | None = None
+        self.plot_handle: Any | None = None
         self._changing_controls = False
-        self._syncing_slider = False
 
         self.file_dropdown = widgets.Dropdown(
             description="Telemetry CSV",
@@ -362,50 +749,31 @@ class TelemetryDashboard:
             description="Speed",
             style={"description_width": "55px"},
         )
-        self.time_slider = widgets.FloatSlider(
-            description="Time (s)",
-            disabled=True,
-            continuous_update=True,
-            readout_format=".3f",
-            layout=widgets.Layout(width="760px"),
-            style={"description_width": "65px"},
-        )
         self.message = widgets.HTML()
         self.summary = widgets.HTML()
-        self.position_readout = widgets.HTML()
-        self.figure_output = widgets.Output()
 
-        backend = matplotlib.get_backend().lower()
-        if "ipympl" in backend or "widget" in backend:
-            backend_note = (
-                "<span style='color:#46635b'>Drag the yellow handle on the map; "
-                "it snaps to the nearest recorded GPS sample. Click the track or drag the time "
-                "slider for precise positioning.</span>"
+        self.interaction_note = widgets.HTML(
+            value=(
+                "<span style='color:#46635b'>Move or drag the pointer along the track trace. "
+                "The yellow marker snaps to the nearest recorded GPS sample and moves the "
+                "time rules and value markers on every graph. Hover for the exact telemetry. "
+                "This uses VS Code's bundled Vega-Lite renderer—no widget CDN is required.</span>"
             )
-        else:
-            backend_note = (
-                "<b style='color:#b42318'>The current Matplotlib backend is not interactive. "
-                "Install ipympl and run <code>%matplotlib widget</code> before creating the dashboard.</b>"
-            )
-        self.interaction_note = widgets.HTML(value=backend_note)
+        )
 
         self.widget = widgets.VBox(
             [
                 widgets.HBox([self.file_dropdown, self.refresh_button]),
                 widgets.HBox([self.lap_dropdown, self.speed_unit]),
-                self.time_slider,
                 self.interaction_note,
                 self.message,
-                self.position_readout,
                 self.summary,
-                self.figure_output,
             ]
         )
 
         self.file_dropdown.observe(self._on_file_change, names="value")
         self.lap_dropdown.observe(self._on_lap_change, names="value")
         self.speed_unit.observe(self._on_speed_unit_change, names="value")
-        self.time_slider.observe(self._on_time_change, names="value")
         self.refresh_button.on_click(self._on_refresh_click)
         self.refresh_files(default_file=default_file)
 
@@ -423,6 +791,7 @@ class TelemetryDashboard:
         """Display the dashboard in a notebook cell."""
 
         display(self.widget)
+        self._update_plot_display(create=True)
 
     def refresh_files(self, default_file: str | Path | None = None) -> None:
         """Rescan ``data_dir`` and load the requested or newest CSV."""
@@ -461,16 +830,6 @@ class TelemetryDashboard:
         if not self._changing_controls and self.selected_lap is not None:
             self._draw_selected_lap()
 
-    def _on_time_change(self, change: dict[str, Any]) -> None:
-        if self._syncing_slider or self.lap_data.empty:
-            return
-        time_values = self.lap_data["Elapsed (s)"].to_numpy(dtype=float)
-        requested = float(change["new"])
-        insertion = int(np.searchsorted(time_values, requested, side="left"))
-        candidates = [max(0, insertion - 1), min(len(time_values) - 1, insertion)]
-        index = min(candidates, key=lambda candidate: abs(time_values[candidate] - requested))
-        self._update_selection(index, sync_slider=False)
-
     def _load_selected_file(self) -> None:
         path = self.selected_file
         if path is None:
@@ -497,9 +856,8 @@ class TelemetryDashboard:
             self.lap_dropdown.options = [("No timed laps in this recording", None)]
             self.lap_dropdown.value = None
             self.lap_dropdown.disabled = True
-            self.time_slider.disabled = True
             self._changing_controls = False
-            self.position_readout.value = (
+            self.message.value = (
                 "<b>No positive lap IDs with elapsed time were recorded in this file.</b> "
                 "Choose another CSV above."
             )
@@ -515,7 +873,6 @@ class TelemetryDashboard:
         self.lap_dropdown.disabled = False
         self.lap_dropdown.options = options
         self.lap_dropdown.value = fastest
-        self.time_slider.disabled = False
         self._changing_controls = False
         self._draw_selected_lap()
 
@@ -606,272 +963,41 @@ class TelemetryDashboard:
             self._clear_figure()
             return
 
-        self._disconnect_figure()
-        if self.fig is not None:
-            plt.close(self.fig)
-
         self.lap_data = lap_data
-        time_values = lap_data["Elapsed (s)"].to_numpy(dtype=float)
-        speed_column = "Speed (km/h)" if self.speed_unit.value == "km/h" else "Speed (MPH)"
-        speed_values = _channel(lap_data, speed_column)
-        throttle_values = _channel(lap_data, "Throttle Position (%)")
-        brake_values = np.clip(_channel(lap_data, "Brake Pressure (bar)"), 0.0, None)
-        lateral_g = _channel(lap_data, "Lateral Acceleration (g)")
-        longitudinal_g = _channel(lap_data, "Longitudinal Acceleration (g)")
-        power_values = _channel(lap_data, "Power Level (KW)")
-        steering_values = _channel(lap_data, "Steering Angle (deg)")
-        longitude = lap_data["Longitude (decimal)"].to_numpy(dtype=float)
-        latitude = lap_data["Latitude (decimal)"].to_numpy(dtype=float)
-
-        with plt.ioff():
-            fig = plt.figure(figsize=(14, 13), constrained_layout=True)
-        grid = fig.add_gridspec(5, 1, height_ratios=[1.35, 1.0, 1.0, 1.0, 3.1])
-        ax_speed = fig.add_subplot(grid[0])
-        ax_inputs = fig.add_subplot(grid[1], sharex=ax_speed)
-        ax_dynamics = fig.add_subplot(grid[2], sharex=ax_speed)
-        ax_power = fig.add_subplot(grid[3], sharex=ax_speed)
-        ax_track = fig.add_subplot(grid[4])
-        ax_brake = ax_inputs.twinx()
-        ax_steering = ax_power.twinx()
-
-        lap_time = self.lap_summary.loc[self.lap_summary["Lap"].eq(lap), "Lap Time"].iloc[0]
+        lap_time = self.lap_summary.loc[
+            self.lap_summary["Lap"].eq(lap), "Lap Time"
+        ].iloc[0]
         source = self.selected_file.name if self.selected_file else "telemetry"
-        fig.suptitle(f"{source} · Lap {lap} · {lap_time}", fontsize=15, fontweight="bold")
-
-        ax_speed.plot(time_values, speed_values, color="#1d4ed8", linewidth=1.7)
-        speed_point, = ax_speed.plot([], [], "o", color="#f59e0b", markersize=6, zorder=5)
-        ax_speed.set_ylabel(f"Speed ({self.speed_unit.value})")
-        ax_speed.set_title("Speed")
-
-        ax_inputs.plot(time_values, throttle_values, color="#15803d", linewidth=1.4, label="Throttle")
-        ax_inputs.fill_between(time_values, 0, throttle_values, color="#22c55e", alpha=0.12)
-        throttle_point, = ax_inputs.plot([], [], "o", color="#15803d", markersize=5, zorder=5)
-        ax_inputs.set_ylabel("Throttle (%)", color="#15803d")
-        ax_inputs.set_ylim(-3, 103)
-        ax_brake.plot(time_values, brake_values, color="#dc2626", linewidth=1.25, label="Brake")
-        brake_point, = ax_brake.plot([], [], "o", color="#dc2626", markersize=5, zorder=5)
-        ax_brake.set_ylabel("Brake (bar)", color="#dc2626")
-        ax_inputs.set_title("Driver inputs")
-
-        ax_dynamics.plot(time_values, lateral_g, color="#7c3aed", linewidth=1.25, label="Lateral")
-        ax_dynamics.plot(
-            time_values, longitudinal_g, color="#0891b2", linewidth=1.25, label="Longitudinal"
+        self.plot_spec = build_telemetry_plot_spec(
+            lap_data,
+            title=f"{source} · Lap {lap} · {lap_time}",
+            speed_unit=self.speed_unit.value,
         )
-        lateral_point, = ax_dynamics.plot([], [], "o", color="#7c3aed", markersize=5, zorder=5)
-        longitudinal_point, = ax_dynamics.plot([], [], "o", color="#0891b2", markersize=5, zorder=5)
-        ax_dynamics.axhline(0, color="#94a3b8", linewidth=0.8)
-        ax_dynamics.set_ylabel("Acceleration (g)")
-        ax_dynamics.set_title("Vehicle dynamics")
-        ax_dynamics.legend(loc="upper right", ncol=2, frameon=True)
+        self._update_plot_display()
 
-        ax_power.plot(time_values, power_values, color="#ea580c", linewidth=1.25)
-        power_point, = ax_power.plot([], [], "o", color="#ea580c", markersize=5, zorder=5)
-        ax_power.axhline(0, color="#94a3b8", linewidth=0.8)
-        ax_power.set_ylabel("Power (kW)", color="#ea580c")
-        ax_power.set_xlabel("Elapsed lap time (s)")
-        ax_power.set_title("Power and steering")
-        ax_steering.plot(time_values, steering_values, color="#475569", linewidth=0.95, alpha=0.8)
-        steering_point, = ax_steering.plot([], [], "o", color="#475569", markersize=4, zorder=5)
-        ax_steering.set_ylabel("Steering (deg)", color="#475569")
-
-        for axis in (ax_speed, ax_inputs, ax_dynamics, ax_power):
-            axis.grid(True, color="#d8dee5", linewidth=0.7, alpha=0.8)
-            axis.margins(x=0)
-
-        points = np.column_stack([longitude, latitude])
-        segments = np.stack([points[:-1], points[1:]], axis=1)
-        segment_speeds = (speed_values[:-1] + speed_values[1:]) / 2.0
-        finite_speeds = segment_speeds[np.isfinite(segment_speeds)]
-        speed_min = float(np.nanmin(finite_speeds)) if len(finite_speeds) else 0.0
-        speed_max = float(np.nanmax(finite_speeds)) if len(finite_speeds) else 1.0
-        if np.isclose(speed_min, speed_max):
-            speed_max = speed_min + 1.0
-        track_collection = LineCollection(
-            segments,
-            cmap="turbo",
-            norm=plt.Normalize(speed_min, speed_max),
-            linewidth=4.0,
-            capstyle="round",
-            zorder=2,
-        )
-        track_collection.set_array(segment_speeds)
-        ax_track.add_collection(track_collection)
-        colorbar = fig.colorbar(track_collection, ax=ax_track, pad=0.015, fraction=0.035)
-        colorbar.set_label(f"Speed ({self.speed_unit.value})")
-
-        ax_track.plot(
-            longitude[0], latitude[0], marker="o", markersize=8, markerfacecolor="white",
-            markeredgecolor="black", linestyle="None", label="Start", zorder=5
-        )
-        ax_track.plot(
-            longitude[-1], latitude[-1], marker="X", markersize=8, color="black",
-            linestyle="None", label="End", zorder=5
-        )
-        position_handle, = ax_track.plot(
-            [longitude[0]],
-            [latitude[0]],
-            marker="o",
-            markersize=14,
-            markerfacecolor="#facc15",
-            markeredgecolor="#111827",
-            markeredgewidth=2.0,
-            linestyle="None",
-            label="Drag position",
-            picker=12,
-            zorder=8,
-        )
-        longitude_span = max(float(np.ptp(longitude)), 1e-6)
-        latitude_span = max(float(np.ptp(latitude)), 1e-6)
-        ax_track.set_xlim(float(np.min(longitude)) - longitude_span * 0.04, float(np.max(longitude)) + longitude_span * 0.04)
-        ax_track.set_ylim(float(np.min(latitude)) - latitude_span * 0.04, float(np.max(latitude)) + latitude_span * 0.04)
-        mean_latitude = float(np.mean(latitude))
-        ax_track.set_aspect(1.0 / max(np.cos(np.radians(mean_latitude)), 0.1))
-        ax_track.set_xlabel("Longitude")
-        ax_track.set_ylabel("Latitude")
-        ax_track.set_title("Track map — drag the yellow handle or click anywhere on the trace")
-        ax_track.grid(True, color="#d8dee5", linewidth=0.7, alpha=0.7)
-        ax_track.legend(loc="best", frameon=True)
-
-        cursor_lines = [
-            axis.axvline(time_values[0], color="#f59e0b", linewidth=1.35, alpha=0.95, zorder=4)
-            for axis in (ax_speed, ax_inputs, ax_dynamics, ax_power)
-        ]
-
-        self.fig = fig
-        self.ax_track = ax_track
-        self.position_handle = position_handle
-        self._cursor_lines = cursor_lines
-        self._value_markers = [
-            (speed_point, speed_values),
-            (throttle_point, throttle_values),
-            (brake_point, brake_values),
-            (lateral_point, lateral_g),
-            (longitudinal_point, longitudinal_g),
-            (power_point, power_values),
-            (steering_point, steering_values),
-        ]
-        self._connection_ids = [
-            fig.canvas.mpl_connect("button_press_event", self._on_map_press),
-            fig.canvas.mpl_connect("motion_notify_event", self._on_map_motion),
-            fig.canvas.mpl_connect("button_release_event", self._on_map_release),
-        ]
-
-        positive_steps = np.diff(time_values)
-        positive_steps = positive_steps[positive_steps > 0]
-        slider_step = float(np.median(positive_steps)) if len(positive_steps) else 0.001
-        self._syncing_slider = True
-        self.time_slider.min = float(time_values[0])
-        self.time_slider.max = float(time_values[-1])
-        self.time_slider.step = max(slider_step, 0.001)
-        self.time_slider.value = float(time_values[0])
-        self._syncing_slider = False
-
-        self._update_selection(0)
-        with self.figure_output:
-            clear_output(wait=True)
-            backend = matplotlib.get_backend().lower()
-            if "ipympl" in backend or "widget" in backend:
-                display(fig.canvas)
-            else:
-                display(fig)
-
-    def _toolbar_is_active(self) -> bool:
-        if self.fig is None:
-            return False
-        toolbar = getattr(self.fig.canvas, "toolbar", None)
-        mode = getattr(toolbar, "mode", "") if toolbar is not None else ""
-        return bool(str(mode))
-
-    def _on_map_press(self, event: Any) -> None:
-        if (
-            event.button != 1
-            or event.inaxes is not self.ax_track
-            or event.xdata is None
-            or event.ydata is None
-            or self._toolbar_is_active()
-        ):
+    def _update_plot_display(self, *, create: bool = False) -> None:
+        if self.plot_spec is None:
             return
-        self._dragging = True
-        self._select_nearest(float(event.xdata), float(event.ydata))
-
-    def _on_map_motion(self, event: Any) -> None:
-        if (
-            not self._dragging
-            or event.inaxes is not self.ax_track
-            or event.xdata is None
-            or event.ydata is None
-        ):
-            return
-        self._select_nearest(float(event.xdata), float(event.ydata))
-
-    def _on_map_release(self, _: Any) -> None:
-        self._dragging = False
-
-    def _select_nearest(self, longitude: float, latitude: float) -> None:
-        index = nearest_sample_index(
-            self.lap_data,
-            longitude,
-            latitude,
-            current_index=self.current_index,
-        )
-        self._update_selection(index)
-
-    def _update_selection(self, index: int, *, sync_slider: bool = True) -> None:
-        if self.lap_data.empty or self.fig is None:
-            return
-        index = int(np.clip(index, 0, len(self.lap_data) - 1))
-        self.current_index = index
-        row = self.lap_data.iloc[index]
-        elapsed_s = float(row["Elapsed (s)"])
-        longitude = float(row["Longitude (decimal)"])
-        latitude = float(row["Latitude (decimal)"])
-
-        self.position_handle.set_data([longitude], [latitude])
-        for cursor in self._cursor_lines:
-            cursor.set_xdata([elapsed_s, elapsed_s])
-        for marker, values in self._value_markers:
-            marker.set_data([elapsed_s], [values[index]])
-
-        if sync_slider:
-            self._syncing_slider = True
-            self.time_slider.value = elapsed_s
-            self._syncing_slider = False
-
-        speed_column = "Speed (km/h)" if self.speed_unit.value == "km/h" else "Speed (MPH)"
-        speed = float(row[speed_column])
-        throttle = float(row["Throttle Position (%)"])
-        brake = max(0.0, float(row["Brake Pressure (bar)"]))
-        lateral_g = float(row.get("Lateral Acceleration (g)", np.nan))
-        longitudinal_g = float(row.get("Longitudinal Acceleration (g)", np.nan))
-        power = float(row.get("Power Level (KW)", np.nan))
-        steering = float(row.get("Steering Angle (deg)", np.nan))
-        distance = float(row["GPS Distance (m)"])
-
-        self.position_readout.value = (
-            "<div style='padding:7px 10px;background:#f4f7f9;border-left:4px solid #facc15'>"
-            f"<b>Lap {self.selected_lap} · {elapsed_s:.3f} s · {distance:.0f} m</b> &nbsp; "
-            f"Speed {speed:.1f} {self.speed_unit.value} · Throttle {throttle:.1f}% · "
-            f"Brake {brake:.1f} bar · Lat {lateral_g:+.2f} g · Long {longitudinal_g:+.2f} g · "
-            f"Power {power:+.1f} kW · Steering {steering:+.1f}°"
-            "</div>"
-        )
-        self.fig.canvas.draw_idle()
-
-    def _disconnect_figure(self) -> None:
-        if self.fig is not None:
-            for connection_id in self._connection_ids:
-                self.fig.canvas.mpl_disconnect(connection_id)
-        self._connection_ids = []
-        self._dragging = False
+        bundle = {
+            "application/vnd.vegalite.v5+json": self.plot_spec,
+            "text/plain": (
+                "Interactive telemetry view. Open this notebook in VS Code or "
+                "JupyterLab with Vega-Lite support."
+            ),
+        }
+        if self.plot_handle is None:
+            if create:
+                self.plot_handle = display(bundle, raw=True, display_id=True)
+        else:
+            self.plot_handle.update(bundle, raw=True)
 
     def _clear_figure(self) -> None:
-        self._disconnect_figure()
-        if self.fig is not None:
-            plt.close(self.fig)
-        self.fig = None
+        """Clear the current plot while retaining the historical method name."""
+
+        self.plot_spec = None
         self.lap_data = pd.DataFrame()
-        with self.figure_output:
-            clear_output(wait=True)
+        if self.plot_handle is not None:
+            self.plot_handle.update({"text/plain": ""}, raw=True)
 
     def _set_error(self, message: str) -> None:
         self.message.value = (
@@ -886,6 +1012,7 @@ __all__ = [
     "TelemetryDashboard",
     "build_lap_summary",
     "build_sector_summary",
+    "build_telemetry_plot_spec",
     "discover_telemetry_files",
     "fastest_lap_id",
     "format_lap_time",

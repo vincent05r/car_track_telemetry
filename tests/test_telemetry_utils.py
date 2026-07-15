@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -5,6 +6,7 @@ import pandas as pd
 import pytest
 
 from telemetry_utils import (
+    TelemetryDashboard,
     build_lap_summary,
     build_sector_summary,
     discover_telemetry_files,
@@ -109,3 +111,40 @@ def test_load_rejects_missing_required_columns(tmp_path: Path) -> None:
     pd.DataFrame({"Lap": [1]}).to_csv(path, index=False)
     with pytest.raises(ValueError, match="missing required columns"):
         load_telemetry(path)
+
+
+def test_dashboard_uses_bundled_vegalite_renderer(tmp_path: Path) -> None:
+    frame = sample_telemetry().drop(
+        columns=[
+            "Elapsed (s)",
+            "Speed (km/h)",
+            "Lateral Acceleration (g)",
+            "Longitudinal Acceleration (g)",
+        ]
+    )
+    frame.to_csv(tmp_path / "telemetry.csv", index=False)
+
+    dashboard = TelemetryDashboard(tmp_path)
+    try:
+        spec = dashboard.plot_spec
+        assert spec is not None
+        assert spec["$schema"].endswith("/vega-lite/v5.json")
+        assert len(spec["data"]["values"]) == len(dashboard.lap_data)
+
+        track = spec["vconcat"][-1]
+        selection = track["layer"][2]["params"][0]
+        assert selection["name"] == "telemetry_cursor"
+        assert selection["select"]["nearest"] is True
+        assert selection["select"]["on"] == "pointermove"
+        assert selection["value"] == [{"sample": 0}]
+
+        serialized = json.dumps(spec, allow_nan=False)
+        assert "jupyter-matplotlib" not in serialized
+        assert "car-track-telemetry" not in serialized
+
+        dashboard.speed_unit.value = "MPH"
+        assert dashboard.plot_spec is not None
+        speed_axis = dashboard.plot_spec["vconcat"][0]["layer"][0]["encoding"]["y"]
+        assert speed_axis["title"] == "Speed (MPH)"
+    finally:
+        dashboard._clear_figure()
