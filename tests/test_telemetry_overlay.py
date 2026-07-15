@@ -29,6 +29,7 @@ from telemetry_overlay import (
 
 def synthetic_telemetry(rows: int = 400) -> pd.DataFrame:
     theta = np.linspace(0.0, 2.0 * np.pi, rows)
+    row_index = np.arange(rows)
     latitude_origin = -33.805
     longitude_origin = 150.870
     metres_per_degree = np.pi * 6_371_000.0 / 180.0
@@ -37,6 +38,14 @@ def synthetic_telemetry(rows: int = 400) -> pd.DataFrame:
     longitude = longitude_origin + radius_m * np.cos(theta) / (
         metres_per_degree * np.cos(np.radians(latitude_origin))
     )
+    corner = (row_index >= rows // 3) & (row_index < 2 * rows // 3)
+    corner_index = np.arange(int(np.count_nonzero(corner)))
+    tire_slips = []
+    for phase in range(4):
+        slip = np.full(rows, 0.027778)
+        slip[corner] += 0.034722 * (1 + (corner_index + phase) % 12)
+        slip[: max(1, rows // 20)] = 0.965278
+        tire_slips.append(slip)
     frame = pd.DataFrame(
         {
             "Sample Index": np.arange(rows),
@@ -60,6 +69,10 @@ def synthetic_telemetry(rows: int = 400) -> pd.DataFrame:
             "Tire Pressure Front Right (bar)": np.full(rows, 2.65),
             "Tire Pressure Rear Left (bar)": np.full(rows, 2.7),
             "Tire Pressure Rear Right (bar)": np.full(rows, 2.68),
+            "Tire Slip Front Left (% est.)": tire_slips[0],
+            "Tire Slip Front Right (% est.)": tire_slips[1],
+            "Tire Slip Rear Left (% est.)": tire_slips[2],
+            "Tire Slip Rear Right (% est.)": tire_slips[3],
             "Source": "synthetic.csv",
         }
     )
@@ -120,6 +133,7 @@ def test_track_projection_and_sampler_scaling() -> None:
     track = build_track_reference(telemetry, lap=1, points=300)
     sampler = TelemetrySampler(telemetry, sync)
     sample = sampler.sample(2.0)
+    corner_sample = sampler.sample(3.5)
     launch_sample = sampler.sample(0.0)
     projection = track.project(sample.latitude, sample.longitude)
 
@@ -132,6 +146,10 @@ def test_track_projection_and_sampler_scaling() -> None:
     assert sample.brake_bar >= 0
     assert launch_sample.regen_kw == pytest.approx(100.0)
     assert launch_sample.total_g == pytest.approx(0.5)
+    assert all(np.isnan(value) for value in launch_sample.tire_slip_est_pct)
+    assert sampler.tire_slip_baseline_pct == pytest.approx((2.7778,) * 4)
+    assert sampler.tire_slip_deadband_pct == pytest.approx(3.4722)
+    assert max(corner_sample.tire_slip_normalized) > 0.5
     assert track.lap_time_ms == pytest.approx(7_980.0)
     assert projection.reference_elapsed_ms == pytest.approx(
         sample.lap_elapsed_ms,
@@ -155,7 +173,8 @@ def test_delta_format_and_panel_geometry_regression() -> None:
         "track": (1029, 23, 1417, 312),
         "inputs": (23, 762, 469, 911),
         "dynamics": (479, 762, 831, 911),
-        "thermal": (993, 743, 1417, 911),
+        "tire_slip": (841, 762, 1098, 911),
+        "thermal": (1108, 762, 1417, 911),
     }
 
     with pytest.raises(ValueError, match="scale maxima"):

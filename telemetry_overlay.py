@@ -62,6 +62,13 @@ LINEAR_CHANNELS = (
     "Power Level (KW)",
 )
 
+TIRE_SLIP_CHANNELS = (
+    "Tire Slip Front Left (% est.)",
+    "Tire Slip Front Right (% est.)",
+    "Tire Slip Rear Left (% est.)",
+    "Tire Slip Rear Right (% est.)",
+)
+
 HELD_CHANNELS = (
     "Lap",
     "Elapsed Time (ms)",
@@ -77,10 +84,7 @@ HELD_CHANNELS = (
     "Front Inverter Temp (%)",
     "Rear Inverter Temp (%)",
     "Battery Temp (%)",
-    "Tire Slip Front Left (% est.)",
-    "Tire Slip Front Right (% est.)",
-    "Tire Slip Rear Left (% est.)",
-    "Tire Slip Rear Right (% est.)",
+    *TIRE_SLIP_CHANNELS,
 )
 
 
@@ -665,6 +669,7 @@ class TelemetrySample:
     tire_pressures_bar: tuple[float, float, float, float]
     brake_temperature_est_pct: tuple[float, float, float, float]
     tire_slip_est_pct: tuple[float, float, float, float]
+    tire_slip_normalized: tuple[float, float, float, float]
 
     @property
     def regen_kw(self) -> float:
@@ -721,6 +726,101 @@ class TelemetrySampler:
             held[valid] = values[previous[valid]]
             self._held_values[column] = held
 
+        (
+            self._tire_slip_pct,
+            self._tire_slip_normalized,
+            self.tire_slip_baseline_pct,
+            self.tire_slip_deadband_pct,
+            self.tire_slip_scale_pct,
+        ) = self._prepare_tire_slip_display()
+
+    def _prepare_tire_slip_display(
+        self,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        tuple[float, float, float, float],
+        float,
+        float,
+    ]:
+        """Build a robust shared tyre-slip scale without changing source values.
+
+        Tesla emits a quantized 96.5278% sentinel while slip is unavailable at
+        very low speed.  Valid values are baseline-corrected per tyre, given a
+        one-quantization-step deadband, normalized by a shared 99.5th
+        percentile, and gamma-expanded so cornering changes remain legible.
+        """
+
+        row_count = len(self.times)
+        slip_pct = np.full((row_count, 4), np.nan, dtype=float)
+        for column_index, column in enumerate(TIRE_SLIP_CHANNELS):
+            values = self._held_values.get(column)
+            if values is None:
+                continue
+            percent = values * 100.0
+            valid = np.isfinite(percent) & (percent < 90.0)
+            slip_pct[valid, column_index] = percent[valid]
+
+        speed = self._linear_values.get("Speed (MPH)")
+        lateral = self._linear_values.get("Lateral Acceleration (m/s^2)")
+        longitudinal = self._linear_values.get("Longitudinal Acceleration (m/s^2)")
+        if speed is not None and lateral is not None and longitudinal is not None:
+            straight = (
+                (speed > 20.0)
+                & (np.abs(lateral / 9.80665) < 0.12)
+                & (np.abs(longitudinal / 9.80665) < 0.12)
+            )
+        else:
+            straight = np.zeros(row_count, dtype=bool)
+
+        baselines: list[float] = []
+        quantization_steps: list[float] = []
+        for column_index in range(4):
+            values = slip_pct[:, column_index]
+            finite = np.isfinite(values)
+            straight_values = values[straight & finite]
+            if len(straight_values) >= 50:
+                baseline = float(np.median(straight_values))
+            else:
+                near_zero = values[finite & (np.abs(values) <= 15.0)]
+                baseline = (
+                    float(np.median(near_zero))
+                    if len(near_zero)
+                    else float(np.nanmedian(values))
+                    if np.any(finite)
+                    else float("nan")
+                )
+            baselines.append(baseline)
+
+            unique = np.unique(values[finite])
+            differences = np.diff(unique)
+            differences = differences[differences > 1e-3]
+            if len(differences):
+                quantization_steps.append(float(np.min(differences)))
+
+        baseline_array = np.asarray(baselines, dtype=float)
+        deadband_pct = max(
+            1.0,
+            float(np.median(quantization_steps)) if quantization_steps else 1.0,
+        )
+        deviation = np.maximum(0.0, np.abs(slip_pct - baseline_array) - deadband_pct)
+        finite_deviation = deviation[np.isfinite(deviation) & (deviation > 0)]
+        scale_pct = max(
+            10.0,
+            float(np.percentile(finite_deviation, 99.5))
+            if len(finite_deviation)
+            else 10.0,
+        )
+        normalized = np.power(np.clip(deviation / scale_pct, 0.0, 1.0), 0.65)
+        normalized[~np.isfinite(slip_pct)] = np.nan
+        return (
+            slip_pct,
+            normalized,
+            tuple(baselines),  # type: ignore[return-value]
+            deadband_pct,
+            scale_pct,
+        )
+
     def _linear(self, column: str, lower: int, upper: int, fraction: float) -> float:
         values = self._linear_values.get(column)
         if values is None:
@@ -775,14 +875,9 @@ class TelemetrySampler:
                 "Brake Temperature Rear Right (% est.)",
             )
         )
-        slips = tuple(
-            self._thermal_percent(self._held(column, index))
-            for column in (
-                "Tire Slip Front Left (% est.)",
-                "Tire Slip Front Right (% est.)",
-                "Tire Slip Rear Left (% est.)",
-                "Tire Slip Rear Right (% est.)",
-            )
+        slips = tuple(float(value) for value in self._tire_slip_pct[index])
+        normalized_slips = tuple(
+            float(value) for value in self._tire_slip_normalized[index]
         )
         return TelemetrySample(
             video_time_s=float(video_time_s),
@@ -820,6 +915,7 @@ class TelemetrySampler:
             tire_pressures_bar=pressures,  # type: ignore[arg-type]
             brake_temperature_est_pct=brake_temperatures,  # type: ignore[arg-type]
             tire_slip_est_pct=slips,  # type: ignore[arg-type]
+            tire_slip_normalized=normalized_slips,  # type: ignore[arg-type]
         )
 
 
@@ -887,12 +983,15 @@ class _RenderAssets:
     track_box: tuple[int, int, int, int]
     inputs_box: tuple[int, int, int, int]
     dynamics_box: tuple[int, int, int, int]
+    tire_slip_box: tuple[int, int, int, int]
     thermal_box: tuple[int, int, int, int]
     static_layers: tuple[tuple[tuple[int, int], Image.Image], ...]
     track_layout: _TrackScreenLayout
     track_line_width: int
     input_rows_y: tuple[int, int, int]
     input_bar_boxes: tuple[tuple[int, int, int, int], ...]
+    tire_slip_cells: tuple[tuple[int, int, int, int], ...]
+    tire_slip_bar_boxes: tuple[tuple[int, int, int, int], ...]
     g_center: tuple[int, int]
     g_radius: int
     thermal_start: int
@@ -937,6 +1036,20 @@ class TelemetryOverlayRenderer:
         if value >= 85:
             return (249, 115, 22)
         if value >= 75:
+            return (250, 204, 21)
+        return (34, 197, 94)
+
+    @staticmethod
+    def _slip_color(fraction: float) -> tuple[int, int, int]:
+        """Use a shared severity palette for the normalized slip bars."""
+
+        if not np.isfinite(fraction):
+            return (148, 163, 184)
+        if fraction >= 0.85:
+            return (239, 68, 68)
+        if fraction >= 0.65:
+            return (249, 115, 22)
+        if fraction >= 0.35:
             return (250, 204, 21)
         return (34, 197, 94)
 
@@ -1045,28 +1158,39 @@ class TelemetryOverlayRenderer:
             margin + int(height * 0.31),
         )
         bottom_y = height - margin
+        bottom_row_top = bottom_y - int(height * 0.16)
         inputs_box = (
             margin,
-            bottom_y - int(height * 0.16),
+            bottom_row_top,
             margin + int(width * 0.31),
             bottom_y,
         )
         dynamics_box = (
             inputs_box[2] + gap,
-            bottom_y - int(height * 0.16),
+            bottom_row_top,
             inputs_box[2] + gap + int(width * 0.245),
             bottom_y,
         )
-        thermal_extra_rows = int(self.style.show_tire_pressures) + int(
-            self.style.show_estimated_temperatures
-        )
         thermal_box = (
-            width - margin - int(width * 0.295),
-            bottom_y - int(height * (0.18 + 0.035 * thermal_extra_rows)),
+            width - margin - int(width * 0.215),
+            bottom_row_top,
             width - margin,
             bottom_y,
         )
-        panel_boxes = (speed_box, track_box, inputs_box, dynamics_box, thermal_box)
+        tire_slip_box = (
+            dynamics_box[2] + gap,
+            bottom_row_top,
+            thermal_box[0] - gap,
+            bottom_y,
+        )
+        panel_boxes = (
+            speed_box,
+            track_box,
+            inputs_box,
+            dynamics_box,
+            tire_slip_box,
+            thermal_box,
+        )
 
         static = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(static, "RGBA")
@@ -1144,6 +1268,41 @@ class TelemetryOverlayRenderer:
             fill=(71, 85, 105, 220),
         )
 
+        sx0, sy0, sx1, sy1 = tire_slip_box
+        slip_width = sx1 - sx0
+        draw.text(
+            (sx0 + pad, sy0 + pad),
+            "TYRE SLIP  NORM" if slip_width >= 150 else "SLIP",
+            font=font_tiny,
+            fill=(203, 213, 225, 255),
+        )
+        slip_content_top = sy0 + pad + max(14, int(round(24 * scale)))
+        slip_column_gap = max(4, int(round(8 * scale)))
+        slip_inner_width = max(2, slip_width - 2 * pad)
+        slip_cell_width = max(1, (slip_inner_width - slip_column_gap) // 2)
+        slip_row_height = max(1, (sy1 - slip_content_top - pad) // 2)
+        tire_slip_cells = tuple(
+            (
+                sx0 + pad + column * (slip_cell_width + slip_column_gap),
+                slip_content_top + row * slip_row_height,
+                sx0
+                + pad
+                + column * (slip_cell_width + slip_column_gap)
+                + slip_cell_width,
+                slip_content_top + (row + 1) * slip_row_height,
+            )
+            for row, column in ((0, 0), (0, 1), (1, 0), (1, 1))
+        )
+        tire_slip_bar_boxes = []
+        for cell, label in zip(tire_slip_cells, ("FL", "FR", "RL", "RR")):
+            cx0, cy0, cx1, cy1 = cell
+            draw.text((cx0, cy0), label, font=font_tiny, fill=(226, 232, 240, 255))
+            bar_y0 = min(cy1 - 4, cy0 + max(10, int(round(19 * scale))))
+            bar_y1 = min(cy1 - 1, bar_y0 + max(4, int(round(8 * scale))))
+            bar_box = (cx0, bar_y0, max(cx0 + 1, cx1), max(bar_y0 + 1, bar_y1))
+            tire_slip_bar_boxes.append(bar_box)
+            self._bar_background(draw, bar_box)
+
         tx0, ty0, _, _ = thermal_box
         draw.text(
             (tx0 + pad, ty0 + pad),
@@ -1179,12 +1338,15 @@ class TelemetryOverlayRenderer:
             track_box=track_box,
             inputs_box=inputs_box,
             dynamics_box=dynamics_box,
+            tire_slip_box=tire_slip_box,
             thermal_box=thermal_box,
             static_layers=static_layers,
             track_layout=track_layout,
             track_line_width=track_line_width,
             input_rows_y=input_rows_y,  # type: ignore[arg-type]
             input_bar_boxes=input_bar_boxes,
+            tire_slip_cells=tire_slip_cells,
+            tire_slip_bar_boxes=tuple(tire_slip_bar_boxes),
             g_center=(center_x, center_y),
             g_radius=g_radius,
             thermal_start=thermal_start,
@@ -1204,6 +1366,7 @@ class TelemetryOverlayRenderer:
             "track": assets.track_box,
             "inputs": assets.inputs_box,
             "dynamics": assets.dynamics_box,
+            "tire_slip": assets.tire_slip_box,
             "thermal": assets.thermal_box,
         }
 
@@ -1395,6 +1558,29 @@ class TelemetryOverlayRenderer:
             (dot_x - dot_radius, dot_y - dot_radius, dot_x + dot_radius, dot_y + dot_radius),
             fill=(*self.style.accent, 255),
         )
+
+        # Actual signed tyre-slip estimates paired with robust, shared-scale bars.
+        show_slip_values = assets.tire_slip_box[2] - assets.tire_slip_box[0] >= 150
+        for value, normalized, cell, bar_box in zip(
+            sample.tire_slip_est_pct,
+            sample.tire_slip_normalized,
+            assets.tire_slip_cells,
+            assets.tire_slip_bar_boxes,
+        ):
+            self._bar_fill(
+                draw,
+                bar_box,
+                normalized,
+                self._slip_color(normalized),
+            )
+            if show_slip_values:
+                draw.text(
+                    (cell[2], cell[1]),
+                    self._fmt(value, "+.1f") + ("%" if np.isfinite(value) else ""),
+                    font=font_tiny,
+                    fill=(241, 245, 249, 255),
+                    anchor="ra",
+                )
 
         # Thermal block. These are normalized Tesla thermal indicators, not °C.
         tx0, _, tx1, _ = assets.thermal_box
