@@ -330,9 +330,9 @@ def build_telemetry_plot_spec(
 
     VS Code bundles the Vega-Lite renderer with its Jupyter renderer extension,
     so this view does not require ipympl, a widget CDN, or custom JavaScript.
-    Comparison samples are interpolated onto the primary lap's GPS-progress
-    points. This lets one map position select the corresponding point on both
-    laps while each curve retains its own elapsed-time values.
+    The comparison lap is rotated to the GPS point nearest the primary start,
+    then interpolated onto the primary lap's distance-progress points. This
+    aligns corners even when two sessions recorded different lap boundaries.
     """
 
     if lap_data.empty:
@@ -426,11 +426,44 @@ def build_telemetry_plot_spec(
     primary_label = f"Primary | {title}"
     series = [("Primary", primary_label, primary_channels)]
     if comparison_lap_data is not None:
-        source_progress = lap_progress(comparison_lap_data)
-        comparison_channels = {
-            name: interpolate_channel(source_progress, values, primary_progress)
-            for name, values in raw_channels(comparison_lap_data).items()
-        }
+        comparison_progress = lap_progress(comparison_lap_data)
+        anchor_index = nearest_sample_index(
+            comparison_lap_data,
+            longitude=float(longitude[0]),
+            latitude=float(latitude[0]),
+        )
+        anchor_progress = float(comparison_progress[anchor_index])
+        aligned_progress = np.concatenate(
+            (
+                comparison_progress[anchor_index:] - anchor_progress,
+                comparison_progress[: anchor_index + 1] + 1.0 - anchor_progress,
+            )
+        )
+        comparison_raw = raw_channels(comparison_lap_data)
+        comparison_channels: dict[str, np.ndarray] = {}
+        for name, values in comparison_raw.items():
+            if name == "time_s":
+                duration = float(np.nanmax(values))
+                anchor_time = float(values[anchor_index])
+                aligned_values = np.concatenate(
+                    (
+                        values[anchor_index:] - anchor_time,
+                        values[: anchor_index + 1] + duration - anchor_time,
+                    )
+                )
+            else:
+                aligned_values = np.concatenate(
+                    (values[anchor_index:], values[: anchor_index + 1])
+                )
+            comparison_channels[name] = interpolate_channel(
+                aligned_progress, aligned_values, primary_progress
+            )
+        comparison_total_distance = float(
+            comparison_lap_data["GPS Distance (m)"].iloc[-1]
+        )
+        comparison_channels["distance_m"] = (
+            primary_progress * comparison_total_distance
+        )
         comparison_channels["progress_pct"] = primary_progress * 100.0
         comparison_channels["east_m"] = (
             comparison_channels["longitude"] - mean_longitude
@@ -490,13 +523,17 @@ def build_telemetry_plot_spec(
         float(np.nanmax(north_m) + y_padding),
     ]
 
-    time_encoding = {
-        "field": "time_s",
-        "type": "quantitative",
-        "title": "Elapsed lap time (s)",
-        "scale": {"zero": False},
-    }
     has_comparison = comparison_lap_data is not None
+    graph_x_encoding = {
+        "field": "progress_pct" if has_comparison else "time_s",
+        "type": "quantitative",
+        "title": "Lap distance (%)" if has_comparison else "Elapsed lap time (s)",
+        "scale": (
+            {"domain": [0, 100], "nice": False, "zero": True}
+            if has_comparison
+            else {"zero": False}
+        ),
+    }
     series_colours = ["#1d4ed8", "#c026d3"]
 
     def series_colour_encoding(*, legend: bool) -> dict[str, Any]:
@@ -512,12 +549,17 @@ def build_telemetry_plot_spec(
 
     cursor_filter = {"filter": {"param": "telemetry_cursor", "empty": False}}
     cursor_rule = {
-        "transform": [cursor_filter],
-        "mark": {"type": "rule", "strokeWidth": 2, "opacity": 0.7},
-        "encoding": {
-            "x": time_encoding,
-            "color": series_colour_encoding(legend=False),
+        "transform": [
+            cursor_filter,
+            {"filter": "datum.series_role === 'Primary'"},
+        ],
+        "mark": {
+            "type": "rule",
+            "color": "#f59e0b",
+            "strokeWidth": 2,
+            "opacity": 0.8,
         },
+        "encoding": {"x": graph_x_encoding},
     }
 
     def single_channel_chart(
@@ -535,7 +577,7 @@ def build_telemetry_plot_spec(
                 {
                     "mark": {"type": "line", "strokeWidth": 1.8},
                     "encoding": {
-                        "x": time_encoding,
+                        "x": graph_x_encoding,
                         "y": {
                             "field": field,
                             "type": "quantitative",
@@ -557,7 +599,7 @@ def build_telemetry_plot_spec(
                         "size": 75,
                     },
                     "encoding": {
-                        "x": time_encoding,
+                        "x": graph_x_encoding,
                         "y": {"field": field, "type": "quantitative"},
                         "color": series_colour_encoding(legend=False),
                     },
@@ -611,7 +653,7 @@ def build_telemetry_plot_spec(
                     "transform": [fold],
                     "mark": {"type": "line", "strokeWidth": 1.35},
                     "encoding": {
-                        "x": time_encoding,
+                        "x": graph_x_encoding,
                         "y": {
                             "field": "value",
                             "type": "quantitative",
@@ -634,7 +676,7 @@ def build_telemetry_plot_spec(
                         "size": 65,
                     },
                     "encoding": {
-                        "x": time_encoding,
+                        "x": graph_x_encoding,
                         "y": {"field": "value", "type": "quantitative"},
                         "color": (
                             series_colour_encoding(legend=False)
@@ -985,13 +1027,15 @@ class TelemetryDashboard:
         )
         self.message = widgets.HTML()
         self.summary = widgets.HTML()
+        self.plot_output = widgets.Output(layout=widgets.Layout(width="100%"))
 
         self.interaction_note = widgets.HTML(
             value=(
                 "<span style='color:#46635b'>Move or drag the pointer along the track trace. "
                 "Speed is always directly above the map; optional graphs appear above speed. "
-                "The yellow marker moves the time rules and value markers on every graph. "
+                "The yellow marker moves the cursor rule and value markers on every graph. "
                 "A comparison marker represents the same GPS-progress point on the other lap. "
+                "Comparison graph axes use lap distance so the same corners line up. "
                 "Hover for exact telemetry. "
                 "This uses VS Code's bundled Vega-Lite renderer—no widget CDN is required.</span>"
             )
@@ -1019,6 +1063,7 @@ class TelemetryDashboard:
                 self.interaction_note,
                 self.message,
                 self.summary,
+                self.plot_output,
             ]
         )
 
@@ -1437,11 +1482,9 @@ class TelemetryDashboard:
                 "JupyterLab with Vega-Lite support."
             ),
         }
-        if self.plot_handle is None:
-            if create:
-                self.plot_handle = display(bundle, raw=True, display_id=True)
-        else:
-            self.plot_handle.update(bundle, raw=True)
+        self.plot_output.clear_output(wait=True)
+        with self.plot_output:
+            display(bundle, raw=True)
 
     def _clear_figure(self) -> None:
         """Clear the current plot while retaining the historical method name."""
@@ -1449,6 +1492,7 @@ class TelemetryDashboard:
         self.plot_spec = None
         self.lap_data = pd.DataFrame()
         self.comparison_lap_data = pd.DataFrame()
+        self.plot_output.clear_output(wait=True)
         if self.plot_handle is not None:
             self.plot_handle.update({"text/plain": ""}, raw=True)
 

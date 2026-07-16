@@ -9,6 +9,7 @@ from telemetry_utils import (
     TelemetryDashboard,
     build_lap_summary,
     build_sector_summary,
+    build_telemetry_plot_spec,
     discover_telemetry_files,
     fastest_lap_id,
     format_lap_time,
@@ -176,7 +177,13 @@ def test_dashboard_optional_charts_and_cross_session_comparison(tmp_path: Path) 
         }
         assert dashboard.plot_spec is not None
         assert len(dashboard.plot_spec["vconcat"]) == 2
+        assert dashboard.widget.children[-1] is dashboard.plot_output
+        assert dashboard.plot_handle is None
         assert dashboard.plot_spec["vconcat"][-2]["title"].endswith("Speed")
+        assert (
+            dashboard.plot_spec["vconcat"][-2]["layer"][0]["encoding"]["x"]["field"]
+            == "time_s"
+        )
         assert dashboard.plot_spec["vconcat"][-1]["title"].startswith("Track map")
 
         for checkbox in dashboard.optional_plot_checkboxes.values():
@@ -215,6 +222,10 @@ def test_dashboard_optional_charts_and_cross_session_comparison(tmp_path: Path) 
         assert colour["field"] == "series"
         assert colour["legend"]["title"] == "Lap"
         assert len(colour["scale"]["domain"]) == 2
+        comparison_x = speed_chart["layer"][0]["encoding"]["x"]
+        assert comparison_x["field"] == "progress_pct"
+        assert comparison_x["title"] == "Lap distance (%)"
+        assert dashboard.plot_handle is None
 
         track = spec["vconcat"][-1]
         assert track["layer"][0]["transform"] == [
@@ -223,3 +234,51 @@ def test_dashboard_optional_charts_and_cross_session_comparison(tmp_path: Path) 
         assert track["layer"][2]["params"][0]["select"]["fields"] == ["sample"]
     finally:
         dashboard._clear_figure()
+
+
+def test_cross_session_comparison_rotates_to_matching_gps_start() -> None:
+    def circular_lap(start_angle: float, duration_s: float) -> pd.DataFrame:
+        sample_count = 241
+        angle = np.linspace(start_angle, start_angle + 2 * np.pi, sample_count)
+        elapsed_s = np.linspace(0.01, duration_s, sample_count)
+        latitude = -33.8 + 0.0015 * np.cos(angle)
+        longitude = 150.8 + 0.0018 * np.sin(angle)
+        speed_kmh = 125 + 28 * np.sin(3 * angle) + 11 * np.cos(7 * angle)
+        frame = pd.DataFrame(
+            {
+                "Lap": 1,
+                "Elapsed Time (ms)": elapsed_s * 1_000,
+                "Elapsed (s)": elapsed_s,
+                "Speed (km/h)": speed_kmh,
+                "Speed (MPH)": speed_kmh / 1.609344,
+                "Latitude (decimal)": latitude,
+                "Longitude (decimal)": longitude,
+                "Throttle Position (%)": 50 + 10 * np.sin(angle),
+                "Brake Pressure (bar)": np.zeros(sample_count),
+            }
+        )
+        return prepare_lap(frame, 1)
+
+    primary = circular_lap(start_angle=0.0, duration_s=100.0)
+    comparison = circular_lap(start_angle=0.85, duration_s=104.0)
+    spec = build_telemetry_plot_spec(
+        primary,
+        title="Primary",
+        speed_unit="km/h",
+        optional_charts=(),
+        comparison_lap_data=comparison,
+        comparison_title="Comparison",
+    )
+
+    records = spec["data"]["values"]
+    primary_speed = np.array(
+        [row["speed"] for row in records if row["series_role"] == "Primary"]
+    )
+    comparison_speed = np.array(
+        [row["speed"] for row in records if row["series_role"] == "Comparison"]
+    )
+    assert np.corrcoef(primary_speed, comparison_speed)[0, 1] > 0.995
+    assert np.mean(np.abs(primary_speed - comparison_speed)) < 1.0
+    speed_x = spec["vconcat"][-2]["layer"][0]["encoding"]["x"]
+    assert speed_x["field"] == "progress_pct"
+    assert speed_x["scale"]["domain"] == [0, 100]
