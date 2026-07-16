@@ -148,3 +148,78 @@ def test_dashboard_uses_bundled_vegalite_renderer(tmp_path: Path) -> None:
         assert speed_axis["title"] == "Speed (MPH)"
     finally:
         dashboard._clear_figure()
+
+
+def test_dashboard_optional_charts_and_cross_session_comparison(tmp_path: Path) -> None:
+    frame = sample_telemetry().drop(
+        columns=[
+            "Elapsed (s)",
+            "Speed (km/h)",
+            "Lateral Acceleration (g)",
+            "Longitudinal Acceleration (g)",
+        ]
+    )
+    comparison_frame = frame.copy()
+    comparison_frame["Speed (MPH)"] += 8
+    comparison_path = tmp_path / "comparison.csv"
+    primary_path = tmp_path / "primary.csv"
+    comparison_frame.to_csv(comparison_path, index=False)
+    frame.to_csv(primary_path, index=False)
+
+    dashboard = TelemetryDashboard(tmp_path, default_file=primary_path.name)
+    try:
+        assert dashboard.selected_optional_charts == ()
+        assert set(dashboard.optional_plot_checkboxes) == {
+            "driver_inputs",
+            "vehicle_dynamics",
+            "power_steering",
+        }
+        assert dashboard.plot_spec is not None
+        assert len(dashboard.plot_spec["vconcat"]) == 2
+        assert dashboard.plot_spec["vconcat"][-2]["title"].endswith("Speed")
+        assert dashboard.plot_spec["vconcat"][-1]["title"].startswith("Track map")
+
+        for checkbox in dashboard.optional_plot_checkboxes.values():
+            checkbox.value = True
+        assert dashboard.plot_spec is not None
+        chart_titles = [chart["title"] for chart in dashboard.plot_spec["vconcat"]]
+        assert chart_titles[:3] == [
+            "Driver inputs",
+            "Vehicle dynamics",
+            "Power and steering",
+        ]
+        assert chart_titles[-2].endswith("Speed")
+        assert chart_titles[-1].startswith("Track map")
+
+        dashboard.comparison_enabled.value = True
+        dashboard.comparison_file_dropdown.value = str(comparison_path)
+        dashboard.comparison_lap_dropdown.value = 1
+
+        spec = dashboard.plot_spec
+        assert spec is not None
+        assert dashboard.selected_comparison_file == comparison_path
+        assert dashboard.selected_comparison_lap == 1
+        assert not dashboard.comparison_lap_data.empty
+        assert dashboard.comparison_telemetry["Source"].unique().tolist() == [
+            comparison_path.name
+        ]
+        assert len(spec["data"]["values"]) == 2 * len(dashboard.lap_data)
+        assert {row["series_role"] for row in spec["data"]["values"]} == {
+            "Primary",
+            "Comparison",
+        }
+
+        speed_chart = spec["vconcat"][-2]
+        assert speed_chart["title"] == "Speed comparison"
+        colour = speed_chart["layer"][0]["encoding"]["color"]
+        assert colour["field"] == "series"
+        assert colour["legend"]["title"] == "Lap"
+        assert len(colour["scale"]["domain"]) == 2
+
+        track = spec["vconcat"][-1]
+        assert track["layer"][0]["transform"] == [
+            {"filter": "datum.series_role === 'Primary'"}
+        ]
+        assert track["layer"][2]["params"][0]["select"]["fields"] == ["sample"]
+    finally:
+        dashboard._clear_figure()

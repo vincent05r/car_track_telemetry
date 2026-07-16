@@ -37,6 +37,12 @@ GRAPH_CHANNELS = (
     "State of Charge (%)",
 )
 
+OPTIONAL_PLOT_GROUPS = (
+    "driver_inputs",
+    "vehicle_dynamics",
+    "power_steering",
+)
+
 
 def discover_telemetry_files(data_dir: str | Path) -> list[Path]:
     """Return telemetry CSVs directly inside *data_dir*, sorted by filename."""
@@ -316,17 +322,36 @@ def build_telemetry_plot_spec(
     *,
     title: str,
     speed_unit: str,
+    optional_charts: tuple[str, ...] = OPTIONAL_PLOT_GROUPS,
+    comparison_lap_data: pd.DataFrame | None = None,
+    comparison_title: str | None = None,
 ) -> dict[str, Any]:
-    """Build a self-contained Vega-Lite v5 specification for one lap.
+    """Build a self-contained Vega-Lite v5 specification for one or two laps.
 
     VS Code bundles the Vega-Lite renderer with its Jupyter renderer extension,
     so this view does not require ipympl, a widget CDN, or custom JavaScript.
+    Comparison samples are interpolated onto the primary lap's GPS-progress
+    points. This lets one map position select the corresponding point on both
+    laps while each curve retains its own elapsed-time values.
     """
 
     if lap_data.empty:
         raise ValueError("Cannot plot an empty lap")
     if speed_unit not in {"km/h", "MPH"}:
         raise ValueError("speed_unit must be 'km/h' or 'MPH'")
+    if comparison_lap_data is not None and comparison_lap_data.empty:
+        raise ValueError("Cannot compare an empty lap")
+
+    selected_optional = tuple(dict.fromkeys(optional_charts))
+    unknown_optional = sorted(set(selected_optional).difference(OPTIONAL_PLOT_GROUPS))
+    if unknown_optional:
+        raise ValueError(f"Unknown optional chart groups: {unknown_optional}")
+    for frame, frame_name in (
+        (lap_data, "primary lap"),
+        (comparison_lap_data, "comparison lap"),
+    ):
+        if frame is not None and "GPS Distance (m)" not in frame:
+            raise ValueError(f"The {frame_name} has no GPS Distance (m) column")
 
     speed_column = "Speed (km/h)" if speed_unit == "km/h" else "Speed (MPH)"
     latitude = lap_data["Latitude (decimal)"].to_numpy(dtype=float)
@@ -338,29 +363,117 @@ def build_telemetry_plot_spec(
     east_m = (longitude - mean_longitude) * longitude_scale
     north_m = (latitude - mean_latitude) * latitude_scale
 
-    channels = {
-        "time_s": _json_values(lap_data["Elapsed (s)"].to_numpy(dtype=float), 3),
-        "distance_m": _json_values(lap_data["GPS Distance (m)"].to_numpy(dtype=float), 1),
-        "speed": _json_values(_channel(lap_data, speed_column), 2),
-        "throttle": _json_values(_channel(lap_data, "Throttle Position (%)"), 2),
-        "brake": _json_values(
-            np.clip(_channel(lap_data, "Brake Pressure (bar)"), 0.0, None), 2
-        ),
-        "lateral_g": _json_values(_channel(lap_data, "Lateral Acceleration (g)"), 3),
-        "longitudinal_g": _json_values(
-            _channel(lap_data, "Longitudinal Acceleration (g)"), 3
-        ),
-        "power": _json_values(_channel(lap_data, "Power Level (KW)"), 2),
-        "steering": _json_values(_channel(lap_data, "Steering Angle (deg)"), 2),
-        "east_m": _json_values(east_m, 2),
-        "north_m": _json_values(north_m, 2),
-        "longitude": _json_values(longitude, 7),
-        "latitude": _json_values(latitude, 7),
+    def lap_progress(frame: pd.DataFrame) -> np.ndarray:
+        distance = frame["GPS Distance (m)"].to_numpy(dtype=float)
+        finite = np.isfinite(distance)
+        if finite.sum() >= 2:
+            row_index = np.arange(len(distance), dtype=float)
+            distance = np.interp(row_index, row_index[finite], distance[finite])
+        elif finite.sum() == 1:
+            distance = np.full(len(distance), distance[finite][0], dtype=float)
+        else:
+            distance = np.zeros(len(distance), dtype=float)
+        distance = np.maximum.accumulate(distance - distance[0])
+        total = float(distance[-1])
+        if total <= 0.0:
+            return np.linspace(0.0, 1.0, len(frame))
+        return np.clip(distance / total, 0.0, 1.0)
+
+    def raw_channels(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+        return {
+            "time_s": frame["Elapsed (s)"].to_numpy(dtype=float),
+            "distance_m": frame["GPS Distance (m)"].to_numpy(dtype=float),
+            "speed": _channel(frame, speed_column),
+            "throttle": _channel(frame, "Throttle Position (%)"),
+            "brake": np.clip(_channel(frame, "Brake Pressure (bar)"), 0.0, None),
+            "lateral_g": _channel(frame, "Lateral Acceleration (g)"),
+            "longitudinal_g": _channel(frame, "Longitudinal Acceleration (g)"),
+            "power": _channel(frame, "Power Level (KW)"),
+            "steering": _channel(frame, "Steering Angle (deg)"),
+            "longitude": _channel(frame, "Longitude (decimal)"),
+            "latitude": _channel(frame, "Latitude (decimal)"),
+        }
+
+    def interpolate_channel(
+        source_progress: np.ndarray,
+        values: np.ndarray,
+        target_progress: np.ndarray,
+    ) -> np.ndarray:
+        finite = np.isfinite(source_progress) & np.isfinite(values)
+        if not finite.any():
+            return np.full(len(target_progress), np.nan, dtype=float)
+        source = source_progress[finite]
+        channel_values = values[finite]
+        order = np.argsort(source, kind="stable")
+        source = source[order]
+        channel_values = channel_values[order]
+        source, unique_indices = np.unique(source, return_index=True)
+        channel_values = channel_values[unique_indices]
+        if len(source) == 1:
+            return np.full(len(target_progress), channel_values[0], dtype=float)
+        return np.interp(target_progress, source, channel_values)
+
+    primary_progress = lap_progress(lap_data)
+    primary_channels = raw_channels(lap_data)
+    primary_channels.update(
+        {
+            "progress_pct": primary_progress * 100.0,
+            "east_m": east_m,
+            "north_m": north_m,
+        }
+    )
+
+    primary_label = f"Primary | {title}"
+    series = [("Primary", primary_label, primary_channels)]
+    if comparison_lap_data is not None:
+        source_progress = lap_progress(comparison_lap_data)
+        comparison_channels = {
+            name: interpolate_channel(source_progress, values, primary_progress)
+            for name, values in raw_channels(comparison_lap_data).items()
+        }
+        comparison_channels["progress_pct"] = primary_progress * 100.0
+        comparison_channels["east_m"] = (
+            comparison_channels["longitude"] - mean_longitude
+        ) * longitude_scale
+        comparison_channels["north_m"] = (
+            comparison_channels["latitude"] - mean_latitude
+        ) * latitude_scale
+        comparison_label = f"Comparison | {comparison_title or 'comparison lap'}"
+        series.append(("Comparison", comparison_label, comparison_channels))
+
+    decimals = {
+        "time_s": 3,
+        "distance_m": 1,
+        "progress_pct": 3,
+        "speed": 2,
+        "throttle": 2,
+        "brake": 2,
+        "lateral_g": 3,
+        "longitudinal_g": 3,
+        "power": 2,
+        "steering": 2,
+        "east_m": 2,
+        "north_m": 2,
+        "longitude": 7,
+        "latitude": 7,
     }
-    records = [
-        {"sample": index, **{name: values[index] for name, values in channels.items()}}
-        for index in range(len(lap_data))
-    ]
+    records: list[dict[str, Any]] = []
+    series_labels: list[str] = []
+    for role, label, channel_values in series:
+        series_labels.append(label)
+        json_channels = {
+            name: _json_values(values, decimals[name])
+            for name, values in channel_values.items()
+        }
+        records.extend(
+            {
+                "sample": index,
+                "series": label,
+                "series_role": role,
+                **{name: values[index] for name, values in json_channels.items()},
+            }
+            for index in range(len(lap_data))
+        )
 
     chart_width = 960
     x_span = max(float(np.nanmax(east_m) - np.nanmin(east_m)), 1.0)
@@ -383,18 +496,34 @@ def build_telemetry_plot_spec(
         "title": "Elapsed lap time (s)",
         "scale": {"zero": False},
     }
+    has_comparison = comparison_lap_data is not None
+    series_colours = ["#1d4ed8", "#c026d3"]
+
+    def series_colour_encoding(*, legend: bool) -> dict[str, Any]:
+        if not has_comparison:
+            return {"value": series_colours[0]}
+        return {
+            "field": "series",
+            "type": "nominal",
+            "title": "Lap",
+            "scale": {"domain": series_labels, "range": series_colours},
+            "legend": {"orient": "top", "title": "Lap"} if legend else None,
+        }
+
     cursor_filter = {"filter": {"param": "telemetry_cursor", "empty": False}}
     cursor_rule = {
         "transform": [cursor_filter],
-        "mark": {"type": "rule", "color": "#f59e0b", "strokeWidth": 2},
-        "encoding": {"x": time_encoding},
+        "mark": {"type": "rule", "strokeWidth": 2, "opacity": 0.7},
+        "encoding": {
+            "x": time_encoding,
+            "color": series_colour_encoding(legend=False),
+        },
     }
 
     def single_channel_chart(
         field: str,
         chart_title: str,
         axis_title: str,
-        colour: str,
         *,
         height: int = 150,
     ) -> dict[str, Any]:
@@ -404,7 +533,7 @@ def build_telemetry_plot_spec(
             "title": chart_title,
             "layer": [
                 {
-                    "mark": {"type": "line", "color": colour, "strokeWidth": 1.6},
+                    "mark": {"type": "line", "strokeWidth": 1.8},
                     "encoding": {
                         "x": time_encoding,
                         "y": {
@@ -413,6 +542,8 @@ def build_telemetry_plot_spec(
                             "title": axis_title,
                             "scale": {"zero": False},
                         },
+                        "color": series_colour_encoding(legend=True),
+                        "order": {"field": "sample", "type": "quantitative"},
                     },
                 },
                 cursor_rule,
@@ -421,7 +552,6 @@ def build_telemetry_plot_spec(
                     "mark": {
                         "type": "point",
                         "filled": True,
-                        "color": colour,
                         "stroke": "white",
                         "strokeWidth": 1,
                         "size": 75,
@@ -429,6 +559,7 @@ def build_telemetry_plot_spec(
                     "encoding": {
                         "x": time_encoding,
                         "y": {"field": field, "type": "quantitative"},
+                        "color": series_colour_encoding(legend=False),
                     },
                 },
             ],
@@ -441,7 +572,7 @@ def build_telemetry_plot_spec(
         chart_title: str,
         axis_title: str,
     ) -> dict[str, Any]:
-        colour_encoding = {
+        channel_colour_encoding = {
             "field": "channel",
             "type": "nominal",
             "title": None,
@@ -453,7 +584,24 @@ def build_telemetry_plot_spec(
                 ) + "}[datum.label]",
             },
         }
+        channel_dash_encoding = {
+            "field": "channel",
+            "type": "nominal",
+            "title": "Signal",
+            "scale": {"domain": fields, "range": [[1, 0], [7, 3]]},
+            "legend": {
+                "orient": "top-right",
+                "labelExpr": "{" + ",".join(
+                    f"'{field}':'{label}'" for field, label in zip(fields, labels)
+                ) + "}[datum.label]",
+            },
+        }
         fold = {"fold": fields, "as": ["channel", "value"]}
+        line_colour = (
+            series_colour_encoding(legend=True)
+            if has_comparison
+            else channel_colour_encoding
+        )
         return {
             "width": chart_width,
             "height": 135,
@@ -470,7 +618,9 @@ def build_telemetry_plot_spec(
                             "title": axis_title,
                             "scale": {"zero": False},
                         },
-                        "color": colour_encoding,
+                        "color": line_colour,
+                        "order": {"field": "sample", "type": "quantitative"},
+                        **({"strokeDash": channel_dash_encoding} if has_comparison else {}),
                     },
                 },
                 cursor_rule,
@@ -486,7 +636,26 @@ def build_telemetry_plot_spec(
                     "encoding": {
                         "x": time_encoding,
                         "y": {"field": "value", "type": "quantitative"},
-                        "color": colour_encoding,
+                        "color": (
+                            series_colour_encoding(legend=False)
+                            if has_comparison
+                            else channel_colour_encoding
+                        ),
+                        **(
+                            {
+                                "shape": {
+                                    "field": "channel",
+                                    "type": "nominal",
+                                    "scale": {
+                                        "domain": fields,
+                                        "range": ["circle", "diamond"],
+                                    },
+                                    "legend": None,
+                                }
+                            }
+                            if has_comparison
+                            else {}
+                        ),
                     },
                 },
             ],
@@ -505,8 +674,10 @@ def build_telemetry_plot_spec(
         "scale": {"domain": north_domain, "nice": False, "zero": False},
     }
     tooltip = [
+        {"field": "series", "type": "nominal", "title": "Lap"},
         {"field": "time_s", "type": "quantitative", "title": "Lap time (s)", "format": ".3f"},
         {"field": "distance_m", "type": "quantitative", "title": "Distance (m)", "format": ".0f"},
+        {"field": "progress_pct", "type": "quantitative", "title": "Lap progress (%)", "format": ".1f"},
         {
             "field": "speed",
             "type": "quantitative",
@@ -527,13 +698,15 @@ def build_telemetry_plot_spec(
         {"field": "latitude", "type": "quantitative", "title": "Latitude", "format": ".6f"},
         {"field": "longitude", "type": "quantitative", "title": "Longitude", "format": ".6f"},
     ]
-    last_sample = len(records) - 1
+    primary_filter = {"filter": "datum.series_role === 'Primary'"}
+    last_sample = len(lap_data) - 1
     track_chart = {
         "width": chart_width,
         "height": track_height,
         "title": "Track map — move or drag the pointer along the trace",
         "layer": [
             {
+                "transform": [primary_filter],
                 "mark": {
                     "type": "line",
                     "color": "#94a3b8",
@@ -548,6 +721,7 @@ def build_telemetry_plot_spec(
                 },
             },
             {
+                "transform": [primary_filter],
                 "mark": {"type": "point", "filled": True, "size": 16, "opacity": 0.8},
                 "encoding": {
                     "x": track_x,
@@ -561,6 +735,7 @@ def build_telemetry_plot_spec(
                 },
             },
             {
+                "transform": [primary_filter],
                 "params": [
                     {
                         "name": "telemetry_cursor",
@@ -579,7 +754,9 @@ def build_telemetry_plot_spec(
                 "encoding": {"x": track_x, "y": track_y, "tooltip": tooltip},
             },
             {
-                "transform": [{"filter": "datum.sample === 0"}],
+                "transform": [
+                    {"filter": "datum.series_role === 'Primary' && datum.sample === 0"}
+                ],
                 "mark": {
                     "type": "point",
                     "filled": True,
@@ -591,7 +768,14 @@ def build_telemetry_plot_spec(
                 "encoding": {"x": track_x, "y": track_y},
             },
             {
-                "transform": [{"filter": f"datum.sample === {last_sample}"}],
+                "transform": [
+                    {
+                        "filter": (
+                            "datum.series_role === 'Primary' && "
+                            f"datum.sample === {last_sample}"
+                        )
+                    }
+                ],
                 "mark": {
                     "type": "point",
                     "filled": True,
@@ -602,7 +786,7 @@ def build_telemetry_plot_spec(
                 "encoding": {"x": track_x, "y": track_y},
             },
             {
-                "transform": [cursor_filter],
+                "transform": [primary_filter, cursor_filter],
                 "mark": {
                     "type": "point",
                     "filled": True,
@@ -615,6 +799,7 @@ def build_telemetry_plot_spec(
             },
             {
                 "transform": [
+                    primary_filter,
                     cursor_filter,
                     {
                         "calculate": (
@@ -642,40 +827,47 @@ def build_telemetry_plot_spec(
         ],
     }
 
+    optional_specs = {
+        "driver_inputs": folded_chart(
+            ["throttle", "brake"],
+            ["Throttle (%)", "Brake (bar)"],
+            ["#15803d", "#dc2626"],
+            "Driver inputs",
+            "Percent / bar",
+        ),
+        "vehicle_dynamics": folded_chart(
+            ["lateral_g", "longitudinal_g"],
+            ["Lateral", "Longitudinal"],
+            ["#7c3aed", "#0891b2"],
+            "Vehicle dynamics",
+            "Acceleration (g)",
+        ),
+        "power_steering": folded_chart(
+            ["power", "steering"],
+            ["Power (kW)", "Steering (deg)"],
+            ["#ea580c", "#475569"],
+            "Power and steering",
+            "kW / degrees",
+        ),
+    }
+    speed_title = "Speed comparison" if has_comparison else f"{title} — Speed"
+    speed_chart = single_channel_chart(
+        "speed",
+        speed_title,
+        f"Speed ({speed_unit})",
+    )
+    charts = [
+        optional_specs[group]
+        for group in OPTIONAL_PLOT_GROUPS
+        if group in selected_optional
+    ]
+    charts.extend([speed_chart, track_chart])
+
     return {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "description": "Linked Tesla Track Mode telemetry and GPS trace.",
+        "description": "Linked Tesla Track Mode lap comparison and GPS trace.",
         "data": {"values": records},
-        "vconcat": [
-            single_channel_chart(
-                "speed",
-                f"{title} — Speed",
-                f"Speed ({speed_unit})",
-                "#1d4ed8",
-            ),
-            folded_chart(
-                ["throttle", "brake"],
-                ["Throttle (%)", "Brake (bar)"],
-                ["#15803d", "#dc2626"],
-                "Driver inputs",
-                "Percent / bar",
-            ),
-            folded_chart(
-                ["lateral_g", "longitudinal_g"],
-                ["Lateral", "Longitudinal"],
-                ["#7c3aed", "#0891b2"],
-                "Vehicle dynamics",
-                "Acceleration (g)",
-            ),
-            folded_chart(
-                ["power", "steering"],
-                ["Power (kW)", "Steering (deg)"],
-                ["#ea580c", "#475569"],
-                "Power and steering",
-                "kW / degrees",
-            ),
-            track_chart,
-        ],
+        "vconcat": charts,
         "spacing": 12,
         "resolve": {"scale": {"color": "independent"}},
         "config": {
@@ -721,6 +913,10 @@ class TelemetryDashboard:
         self.timed = pd.DataFrame()
         self.lap_summary = pd.DataFrame()
         self.lap_data = pd.DataFrame()
+        self.comparison_telemetry = pd.DataFrame()
+        self.comparison_timed = pd.DataFrame()
+        self.comparison_lap_summary = pd.DataFrame()
+        self.comparison_lap_data = pd.DataFrame()
         self.current_index = 0
         self.plot_spec: dict[str, Any] | None = None
         self.plot_handle: Any | None = None
@@ -749,22 +945,77 @@ class TelemetryDashboard:
             description="Speed",
             style={"description_width": "55px"},
         )
+        self.optional_plot_checkboxes = {
+            "driver_inputs": widgets.Checkbox(
+                value=False,
+                description="Driver inputs",
+                indent=False,
+                layout=widgets.Layout(width="145px"),
+            ),
+            "vehicle_dynamics": widgets.Checkbox(
+                value=False,
+                description="Vehicle dynamics",
+                indent=False,
+                layout=widgets.Layout(width="165px"),
+            ),
+            "power_steering": widgets.Checkbox(
+                value=False,
+                description="Power and steering",
+                indent=False,
+                layout=widgets.Layout(width="185px"),
+            ),
+        }
+        self.comparison_enabled = widgets.Checkbox(
+            value=False,
+            description="Compare another lap",
+            indent=False,
+            layout=widgets.Layout(width="190px"),
+        )
+        self.comparison_file_dropdown = widgets.Dropdown(
+            description="Comparison CSV",
+            disabled=True,
+            layout=widgets.Layout(width="620px"),
+            style={"description_width": "110px"},
+        )
+        self.comparison_lap_dropdown = widgets.Dropdown(
+            description="Comparison lap",
+            disabled=True,
+            layout=widgets.Layout(width="330px"),
+            style={"description_width": "110px"},
+        )
         self.message = widgets.HTML()
         self.summary = widgets.HTML()
 
         self.interaction_note = widgets.HTML(
             value=(
                 "<span style='color:#46635b'>Move or drag the pointer along the track trace. "
-                "The yellow marker snaps to the nearest recorded GPS sample and moves the "
-                "time rules and value markers on every graph. Hover for the exact telemetry. "
+                "Speed is always directly above the map; optional graphs appear above speed. "
+                "The yellow marker moves the time rules and value markers on every graph. "
+                "A comparison marker represents the same GPS-progress point on the other lap. "
+                "Hover for exact telemetry. "
                 "This uses VS Code's bundled Vega-Lite renderer—no widget CDN is required.</span>"
             )
+        )
+
+        optional_controls = widgets.HBox(
+            [
+                widgets.HTML(
+                    value="<b>Graphs:</b> Speed (always shown)&nbsp;&nbsp; Optional:",
+                    layout=widgets.Layout(width="285px"),
+                ),
+                *self.optional_plot_checkboxes.values(),
+            ]
         )
 
         self.widget = widgets.VBox(
             [
                 widgets.HBox([self.file_dropdown, self.refresh_button]),
                 widgets.HBox([self.lap_dropdown, self.speed_unit]),
+                optional_controls,
+                self.comparison_enabled,
+                widgets.HBox(
+                    [self.comparison_file_dropdown, self.comparison_lap_dropdown]
+                ),
                 self.interaction_note,
                 self.message,
                 self.summary,
@@ -774,6 +1025,17 @@ class TelemetryDashboard:
         self.file_dropdown.observe(self._on_file_change, names="value")
         self.lap_dropdown.observe(self._on_lap_change, names="value")
         self.speed_unit.observe(self._on_speed_unit_change, names="value")
+        for checkbox in self.optional_plot_checkboxes.values():
+            checkbox.observe(self._on_optional_plot_change, names="value")
+        self.comparison_enabled.observe(
+            self._on_comparison_enabled_change, names="value"
+        )
+        self.comparison_file_dropdown.observe(
+            self._on_comparison_file_change, names="value"
+        )
+        self.comparison_lap_dropdown.observe(
+            self._on_comparison_lap_change, names="value"
+        )
         self.refresh_button.on_click(self._on_refresh_click)
         self.refresh_files(default_file=default_file)
 
@@ -786,6 +1048,24 @@ class TelemetryDashboard:
     def selected_lap(self) -> int | None:
         value = self.lap_dropdown.value
         return int(value) if value is not None else None
+
+    @property
+    def selected_comparison_file(self) -> Path | None:
+        value = self.comparison_file_dropdown.value
+        return Path(value) if value else None
+
+    @property
+    def selected_comparison_lap(self) -> int | None:
+        value = self.comparison_lap_dropdown.value
+        return int(value) if value is not None else None
+
+    @property
+    def selected_optional_charts(self) -> tuple[str, ...]:
+        return tuple(
+            group
+            for group in OPTIONAL_PLOT_GROUPS
+            if self.optional_plot_checkboxes[group].value
+        )
 
     def display(self) -> None:
         """Display the dashboard in a notebook cell."""
@@ -802,17 +1082,44 @@ class TelemetryDashboard:
             self._set_error(str(exc))
             self._changing_controls = True
             self.file_dropdown.options = []
+            self.comparison_file_dropdown.options = []
+            self.comparison_file_dropdown.disabled = True
+            self.comparison_lap_dropdown.options = []
+            self.comparison_lap_dropdown.disabled = True
             self._changing_controls = False
             return
 
         requested = Path(default_file) if default_file is not None else files[-1]
         requested_name = requested.name
         selected = next((path for path in files if path.name == requested_name), files[-1])
+        previous_comparison = self.selected_comparison_file
+        comparison_name = previous_comparison.name if previous_comparison else selected.name
+        comparison_selected = next(
+            (path for path in files if path.name == comparison_name), selected
+        )
+        file_options = [(path.name, str(path)) for path in files]
 
         self._changing_controls = True
-        self.file_dropdown.options = [(path.name, str(path)) for path in files]
+        self.file_dropdown.options = file_options
         self.file_dropdown.value = str(selected)
+        self.comparison_file_dropdown.options = file_options
+        self.comparison_file_dropdown.value = str(comparison_selected)
+        self.comparison_file_dropdown.disabled = not self.comparison_enabled.value
         self._changing_controls = False
+        if self.comparison_enabled.value:
+            self._load_comparison_file(redraw=False)
+        else:
+            self.comparison_telemetry = pd.DataFrame()
+            self.comparison_timed = pd.DataFrame()
+            self.comparison_lap_summary = pd.DataFrame()
+            self.comparison_lap_data = pd.DataFrame()
+            self._changing_controls = True
+            self.comparison_lap_dropdown.options = [
+                ("Enable comparison to choose a lap", None)
+            ]
+            self.comparison_lap_dropdown.value = None
+            self.comparison_lap_dropdown.disabled = True
+            self._changing_controls = False
         self._load_selected_file()
 
     def _on_refresh_click(self, _: widgets.Button) -> None:
@@ -828,6 +1135,117 @@ class TelemetryDashboard:
 
     def _on_speed_unit_change(self, _: dict[str, Any]) -> None:
         if not self._changing_controls and self.selected_lap is not None:
+            self._draw_selected_lap()
+
+    def _on_optional_plot_change(self, _: dict[str, Any]) -> None:
+        if not self._changing_controls and self.selected_lap is not None:
+            self._draw_selected_lap()
+
+    def _on_comparison_enabled_change(self, change: dict[str, Any]) -> None:
+        if self._changing_controls:
+            return
+        enabled = bool(change.get("new"))
+        self.comparison_file_dropdown.disabled = not enabled
+        if enabled:
+            self._load_comparison_file(redraw=False)
+        else:
+            self.comparison_lap_dropdown.disabled = True
+            self.comparison_lap_data = pd.DataFrame()
+            self.message.value = ""
+        if self.selected_lap is not None:
+            self._draw_selected_lap()
+
+    def _on_comparison_file_change(self, change: dict[str, Any]) -> None:
+        if not self._changing_controls and change.get("new"):
+            self._load_comparison_file()
+
+    def _on_comparison_lap_change(self, change: dict[str, Any]) -> None:
+        if (
+            not self._changing_controls
+            and self.comparison_enabled.value
+            and change.get("new") is not None
+            and self.selected_lap is not None
+        ):
+            self._draw_selected_lap()
+
+    @staticmethod
+    def _lap_options(summary: pd.DataFrame) -> list[tuple[str, int]]:
+        fastest = fastest_lap_id(summary)
+        options = []
+        for _, row in summary.iterrows():
+            lap = int(row["Lap"])
+            suffix = " · fastest" if lap == fastest else ""
+            options.append((f"Lap {lap} — {row['Lap Time']}{suffix}", lap))
+        return options
+
+    def _default_comparison_lap(self, summary: pd.DataFrame) -> int:
+        ordered = summary.sort_values("Lap Time (ms)")
+        lap_ids = ordered["Lap"].astype(int).tolist()
+        if (
+            self.selected_file == self.selected_comparison_file
+            and self.selected_lap in lap_ids
+            and len(lap_ids) > 1
+        ):
+            return next(lap for lap in lap_ids if lap != self.selected_lap)
+        return lap_ids[0]
+
+    def _load_comparison_file(self, *, redraw: bool = True) -> None:
+        path = self.selected_comparison_file
+        if path is None:
+            return
+
+        previous_lap = self.selected_comparison_lap
+        self.message.value = f"<i>Loading comparison {escape(path.name)}…</i>"
+        try:
+            telemetry = load_telemetry(path)
+            timed = timed_laps(telemetry)
+            summary = build_lap_summary(timed)
+        except Exception as exc:
+            self.comparison_telemetry = pd.DataFrame()
+            self.comparison_timed = pd.DataFrame()
+            self.comparison_lap_summary = pd.DataFrame()
+            self.comparison_lap_data = pd.DataFrame()
+            self._set_error(f"Comparison file: {exc}")
+            self._changing_controls = True
+            self.comparison_lap_dropdown.options = [("Comparison unavailable", None)]
+            self.comparison_lap_dropdown.value = None
+            self.comparison_lap_dropdown.disabled = True
+            self._changing_controls = False
+            if redraw and self.selected_lap is not None:
+                self._draw_selected_lap()
+            return
+
+        self.comparison_telemetry = telemetry
+        self.comparison_timed = timed
+        self.comparison_lap_summary = summary
+        self.comparison_lap_data = pd.DataFrame()
+        self._changing_controls = True
+        if summary.empty:
+            self.comparison_lap_dropdown.options = [
+                ("No timed laps in this recording", None)
+            ]
+            self.comparison_lap_dropdown.value = None
+            self.comparison_lap_dropdown.disabled = True
+        else:
+            lap_ids = summary["Lap"].astype(int).tolist()
+            selected_lap = (
+                previous_lap
+                if previous_lap in lap_ids
+                else self._default_comparison_lap(summary)
+            )
+            self.comparison_lap_dropdown.options = self._lap_options(summary)
+            self.comparison_lap_dropdown.value = selected_lap
+            self.comparison_lap_dropdown.disabled = not self.comparison_enabled.value
+        self._changing_controls = False
+
+        if summary.empty:
+            self.message.value = (
+                "<b>The comparison file has no positive timed laps.</b> "
+                "Choose another comparison CSV."
+            )
+        else:
+            self.message.value = ""
+        if redraw and self.selected_lap is not None:
             self._draw_selected_lap()
 
     def _load_selected_file(self) -> None:
@@ -865,13 +1283,8 @@ class TelemetryDashboard:
             return
 
         fastest = fastest_lap_id(summary)
-        options = []
-        for _, row in summary.iterrows():
-            lap = int(row["Lap"])
-            suffix = " · fastest" if lap == fastest else ""
-            options.append((f"Lap {lap} — {row['Lap Time']}{suffix}", lap))
         self.lap_dropdown.disabled = False
-        self.lap_dropdown.options = options
+        self.lap_dropdown.options = self._lap_options(summary)
         self.lap_dropdown.value = fastest
         self._changing_controls = False
         self._draw_selected_lap()
@@ -964,15 +1377,54 @@ class TelemetryDashboard:
             return
 
         self.lap_data = lap_data
+        comparison_lap_data: pd.DataFrame | None = None
+        comparison_title: str | None = None
+        if self.comparison_enabled.value:
+            comparison_lap = self.selected_comparison_lap
+            if comparison_lap is not None:
+                try:
+                    comparison_lap_data = prepare_lap(
+                        self.comparison_timed, comparison_lap
+                    )
+                    comparison_time = self.comparison_lap_summary.loc[
+                        self.comparison_lap_summary["Lap"].eq(comparison_lap),
+                        "Lap Time",
+                    ].iloc[0]
+                    comparison_source = (
+                        self.selected_comparison_file.name
+                        if self.selected_comparison_file
+                        else "telemetry"
+                    )
+                    comparison_title = (
+                        f"{comparison_source} · Lap {comparison_lap} · {comparison_time}"
+                    )
+                    self.message.value = ""
+                except Exception as exc:
+                    self._set_error(f"Comparison lap: {exc}")
+                    comparison_lap_data = None
+        self.comparison_lap_data = (
+            comparison_lap_data
+            if comparison_lap_data is not None
+            else pd.DataFrame()
+        )
+
         lap_time = self.lap_summary.loc[
             self.lap_summary["Lap"].eq(lap), "Lap Time"
         ].iloc[0]
         source = self.selected_file.name if self.selected_file else "telemetry"
-        self.plot_spec = build_telemetry_plot_spec(
-            lap_data,
-            title=f"{source} · Lap {lap} · {lap_time}",
-            speed_unit=self.speed_unit.value,
-        )
+        try:
+            self.plot_spec = build_telemetry_plot_spec(
+                lap_data,
+                title=f"{source} · Lap {lap} · {lap_time}",
+                speed_unit=self.speed_unit.value,
+                optional_charts=self.selected_optional_charts,
+                comparison_lap_data=comparison_lap_data,
+                comparison_title=comparison_title,
+            )
+        except Exception as exc:
+            self._set_error(str(exc))
+            self._clear_figure()
+            return
         self._update_plot_display()
 
     def _update_plot_display(self, *, create: bool = False) -> None:
@@ -996,6 +1448,7 @@ class TelemetryDashboard:
 
         self.plot_spec = None
         self.lap_data = pd.DataFrame()
+        self.comparison_lap_data = pd.DataFrame()
         if self.plot_handle is not None:
             self.plot_handle.update({"text/plain": ""}, raw=True)
 
@@ -1008,6 +1461,7 @@ class TelemetryDashboard:
 
 __all__ = [
     "GRAPH_CHANNELS",
+    "OPTIONAL_PLOT_GROUPS",
     "REQUIRED_COLUMNS",
     "TelemetryDashboard",
     "build_lap_summary",
